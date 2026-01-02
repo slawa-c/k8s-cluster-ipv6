@@ -1,0 +1,11 @@
+**.code-workspace**
+**k3s.yaml
+**.vscode**
+**.DS_Store
+**.vagrant**
+**.webarchive
+**.log
+**.AGENT.md
+**.env
+**/node_modules
+
