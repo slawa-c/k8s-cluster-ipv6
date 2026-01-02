@@ -227,13 +227,48 @@ systemctl restart ssh
 ```
 
 ### add admin user
+
+```bash
 adduser admin
 usermod -aG sudo admin
+```
 
 ### make sysctl changes:
+
+```bash
 echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.conf
 echo "net.ipv6.conf.all.accept_ra = 2" >> /etc/sysctl.conf
 sysctl -p
+```
 
 ### check ipv6 prefix
+
+```bash
 rdisc6 -q enp2s0
+```
+
+### docker apt repo https://docs.docker.com/engine/install/debian/
+
+#### Add Docker's official GPG key
+
+```bash
+apt update
+apt install ca-certificates curl gpg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+#### Add the repository to Apt sources
+
+```bash
+tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+apt update
+```
