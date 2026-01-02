@@ -6,7 +6,7 @@ The main idea is to deploy kubernetes cluster in my home lab in subnet where onl
 
 ## Host system
 
-I try to spinup all these VMs on my macbook M2max using VMware Fusion, since I have it. I prepared parent VM based on Linux Debian 13, and spin up several linced clone VMs. 
+I try to spinup all these VMs on my macbook M2max using VMware Fusion, since I have it. I prepared parent VM based on Linux Debian 13, and spin up several linced clone VMs.
 
 ### Basic Debian configuration
 
@@ -17,6 +17,7 @@ apt -y install nano vim net-tools dnsutils iputils-ping traceroute tcpdump iptab
 ```
 
 ### basic network setup - move to systemd-networkd
+
 <https://wiki.debian.org/SystemdNetworkd>
 
 ```bash
@@ -113,7 +114,7 @@ history -c
 echo "VM generalized. Shut down now and convert to template."
 ```
 
-### nsupdate script for updating DNS names in home lab DNS zone.
+### nsupdate script for updating DNS names in home lab DNS zone
 
 Save script content below to nsupdate-script-pfsense.sh and put file in root home directory on debian parent VM.
 
@@ -233,7 +234,7 @@ adduser admin
 usermod -aG sudo admin
 ```
 
-### make sysctl changes:
+### make sysctl changes
 
 ```bash
 echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.conf
@@ -247,7 +248,15 @@ sysctl -p
 rdisc6 -q enp2s0
 ```
 
-### docker apt repo https://docs.docker.com/engine/install/debian/
+### Run nsupdate script to create DNS nsme for the node
+
+```bash
+ ./nsupdate-pfsense-bind.sh
+ ```
+
+### docker apt repo
+
+<https://docs.docker.com/engine/install/debian/>
 
 #### Add Docker's official GPG key
 
@@ -297,7 +306,9 @@ systemctl restart containerd
 systemctl enable containerd
 ```
 
-### k8s registry https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/
+### k8s registry
+
+<https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/>
 
 #### Add Kubernetes repository
 
@@ -307,7 +318,7 @@ chmod a+r /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
 ```
 
-### Setup k3s 
+### Setup k3s
 
 <https://renshaw.au/posts/the-cluster/>
 
@@ -368,3 +379,71 @@ echo "Final k3s config."
 cat /etc/rancher/k3s/config.yaml
 ```
 
+### install k3s
+
+there is a need to create k3s config file before start k3s instalation script
+
+```bash
+./k3s-config-set.sh
+```
+
+#### on first k8s-node01
+
+```bash
+curl -sfL https://get.k3s.io | K3S_TOKEN=supersecret! sh -s - server --cluster-init
+```
+
+#### join k3s cluser on oter nodes
+
+```bash
+curl -sfL https://get.k3s.io | K3S_TOKEN=supersecret! sh -s - server --server https://k8s-node01:6443
+```
+
+```bash
+### network CNI missing
+kubectl get pods --all-namespaces -o wide
+NAMESPACE     NAME                                      READY   STATUS              RESTARTS   AGE   IP       NODE         NOMINATED NODE   READINESS GATES
+kube-system   coredns-7f496c8d7d-7kngk                  0/1     ContainerCreating   0          26s   <none>   k8s-node01   <none>           <none>
+kube-system   local-path-provisioner-578895bd58-kdbmc   0/1     ContainerCreating   0          26s   <none>   k8s-node01   <none>           <none>
+kube-system   metrics-server-7b9c9c4b9c-ghmbf           0/1     ContainerCreating   0          26s   <none>   k8s-node01   <none>           <none>
+```
+
+### install Calico CNI
+
+<https://docs.tigera.io/calico/latest/getting-started/kubernetes/k3s/multi-node-install>
+
+```bash
+#1:
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/operator-crds.yaml
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/tigera-operator.yaml
+
+#2 set calico config
+kubectl create -f - <<EOF
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    # Note: The ipPools section cannot be modified post-install.
+    ipPools:
+      - blockSize: 120
+        cidr: $(rdisc6 -q enp2s0 | cut -d: -f1-3):79fc::/64
+        encapsulation: None
+        natOutgoing: Disabled
+        nodeSelector: all()
+    nodeAddressAutodetectionV6:
+      kubernetes: NodeInternalIP
+EOF
+```
+create Calico API server pods
+
+```bash
+kubectl create -f - <<EOF
+apiVersion: operator.tigera.io/v1
+kind: APIServer 
+metadata: 
+  name: default 
+spec: {}
+EOF
+```
