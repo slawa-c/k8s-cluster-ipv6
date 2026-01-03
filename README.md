@@ -436,6 +436,7 @@ spec:
       kubernetes: NodeInternalIP
 EOF
 ```
+
 create Calico API server pods
 
 ```bash
@@ -447,3 +448,93 @@ metadata:
 spec: {}
 EOF
 ```
+
+### calico config 
+
+```bash
+kubectl create -f - <<EOF
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    # Note: The ipPools section cannot be modified post-install.
+    ipPools:
+      - blockSize: 120
+        cidr: $(rdisc6 -q enp2s0 | cut -d: -f1-3):79fc::/64
+        encapsulation: None
+        natOutgoing: Disabled
+        nodeSelector: all()
+    nodeAddressAutodetectionV6:
+      kubernetes: NodeInternalIP
+EOF
+```
+
+```bash
+kubectl create -f - <<EOF
+apiVersion: operator.tigera.io/v1
+kind: APIServer 
+metadata: 
+  name: default 
+spec: {}
+EOF
+```
+
+```bash
+cat /etc/rancher/k3s/k3s.yaml
+```
+
+### copy content of k3s.yaml
+
+copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
+
+```bash
+     server: https://k8s-node01:6443
+```
+
+### calico BGP peer config
+
+```bash
+kubectl create -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: pfsense
+spec:
+  peerIP: <ipv6 address of BGP router>
+  asNumber: 65101
+EOF
+```
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  serviceClusterIPs:
+  - cidr: 2001:a61:1162:79fc:ff00::/112
+EOF
+```
+
+### coredns check
+
+```bash
+nslookup metrics-server.kube-system.svc.k8s.lzadm.com 2001:a61:1162:79fc:ff00::10
+Server:		2001:a61:1162:79fc:ff00::10
+Address:	2001:a61:1162:79fc:ff00::10#53
+
+Name:	metrics-server.kube-system.svc.k8s.lzadm.com
+Address: 2001:a61:1162:79fc:ff00::c829
+```
+
+### uninstall k3s
+
+```bash
+/usr/local/bin/k3s-killall.sh
+/usr/local/bin/k3s-uninstall.sh
+logout
+```
+
