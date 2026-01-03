@@ -220,11 +220,18 @@ shutdown -h now
 hostnamectl set-hostname k8s-node1
 ```
 
-### generate ssh host keys
+### Generate ssh host keys
 
 ```bash
 /usr/bin/ssh-keygen -A
 systemctl restart ssh
+```
+
+### Disable swap for better performance
+
+```bash
+swapoff -a
+sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 ```
 
 ### add admin user
@@ -449,7 +456,7 @@ spec: {}
 EOF
 ```
 
-### calico config 
+### calico config
 
 ```bash
 kubectl create -f - <<EOF
@@ -537,4 +544,3 @@ Address: 2001:a61:1162:79fc:ff00::c829
 /usr/local/bin/k3s-uninstall.sh
 logout
 ```
-
