@@ -9,7 +9,7 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
 **Key Infrastructure:**
 - **Network:** IPv6-only (2001:a61:1162:79fc::/64 host subnet, 2001:a61:1162:79fd::/64 cluster CIDR)
 - **Router:** pfSense with DNS64/NAT64, FRR BGP (AS 65101)
-- **Cluster:** k3s multi-node with Calico CNI, BGP peering (AS 64512)
+- **Cluster:** k3s multi-node with Calico CNI, BGP peering (AS 65010)
 - **DNS:** Cluster domain `k8s.lzadm.com`, home domain `home.lzadm.com`
 
 **Network Topology:**
@@ -238,7 +238,7 @@ rm -rf /var/log/* /tmp/* /var/tmp/*
 - DNS64/NAT64 configured for IPv4 reachability from IPv6-only hosts
 - BIND9 running on port 5353 for dynamic DNS updates
 - FRR package installed and configured for BGP (AS 65101)
-- BGP peer group configured to accept connections from k8s nodes (AS 64512)
+- BGP peer group configured to accept connections from k8s nodes (AS 65010)
 - **BGP learns routes** for cluster CIDR subnet (79fd::/64) from Calico
 
 **pfSense DHCPv6-PD Configuration:**
@@ -341,12 +341,71 @@ EOF
 ```
 
 **Configure BGP peering:**
+
+BGP AS Numbers:
+| Device | AS Number |
+|--------|-----------|
+| pfSense (FRR) | 65101 |
+| k3s/Calico | 65010 |
+
 ```bash
 # Get the /48 prefix
 PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
 
-# Add pfSense as BGP peer
-kubectl create -f - <<EOF
+# 1. Configure Calico BGP with custom AS number and service advertisement
+kubectl apply -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  asNumber: 65010
+  serviceClusterIPs:
+  - cidr: ${PREFIX_48}:79fd:ff00::/112
+EOF
+
+# 2. Create secret for BGP password (must be in calico-system namespace)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bgp-secrets
+  namespace: calico-system
+type: Opaque
+stringData:
+  pfsense-password: "<your-bgp-password>"
+EOF
+
+# 3. Create RBAC to allow calico-node to read the secret
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bgp-secret-access
+  namespace: calico-system
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["bgp-secrets"]
+  verbs: ["watch", "list", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bgp-secret-access
+  namespace: calico-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bgp-secret-access
+subjects:
+- kind: ServiceAccount
+  name: calico-node
+  namespace: calico-system
+EOF
+
+# 4. Add pfSense as BGP peer with password authentication
+kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPPeer
 metadata:
@@ -354,19 +413,14 @@ metadata:
 spec:
   peerIP: <pfsense-ipv6-address>
   asNumber: 65101
-EOF
-
-# Configure service cluster IP advertisement
-kubectl apply -f - <<EOF
-apiVersion: projectcalico.org/v3
-kind: BGPConfiguration
-metadata:
-  name: default
-spec:
-  serviceClusterIPs:
-  - cidr: ${PREFIX_48}:79fd:ff00::/112
+  password:
+    secretKeyRef:
+      name: bgp-secrets
+      key: pfsense-password
 EOF
 ```
+
+**Note:** BGP passwords must be 80 characters or fewer. See [Calico BGP security docs](https://docs.tigera.io/calico/latest/network-policy/comms/secure-bgp) for details.
 
 **Uninstall k3s:**
 ```bash
