@@ -1,8 +1,29 @@
 # Kubernetes cluster in home lab with IPv6 only setup
 
+> **Note:** See [CLAUDE.md](CLAUDE.md) for comprehensive documentation including network topology, BGP configuration, and troubleshooting.
+
 ## Description
 
 The main idea is to deploy kubernetes cluster in my home lab in subnet where only IPv6 network available, for sure I configured my pfsense router with DNS64 and NAT64 features to provide communications from ipv6 only enabled hosts to ipv4 only resources in Internet.
+
+## Network Topology
+
+```
+[ISP DSLite /56: 2001:a61:1162::/56]
+              │
+              ▼
+        [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  79e0::/60 (79e0-79ef)
+                                  ├──▶ [Unifi UDR7]      79fa::/64
+                                  └──▶ [pfSense]         79fc::/63 (2x /64)
+                                                           ├── 79fc::/64 → host network
+                                                           └── 79fd::/64 → k3s cluster-cidr
+```
+
+**BGP AS Numbers:**
+| Device | AS Number |
+|--------|-----------|
+| pfSense (FRR) | 65101 |
+| k3s/Calico | 65010 |
 
 ## Host system
 
@@ -329,62 +350,22 @@ echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 
 <https://renshaw.au/posts/the-cluster/>
 
-#### k3s-config-set.sh
+#### k3s-server-config-set.sh
+
+The script is located at `debian_vm/scripts/k3s-server-config-set.sh`. It automatically:
+- Detects the node's IPv6 address from the host network (79fc::/64)
+- Configures cluster-cidr using a separate /64 (79fd::/64)
+- Sets up service CIDR and cluster DNS within the cluster-cidr range
 
 ```bash
-#!/bin/bash
-
-# --- Find the primary IPv6 interface (the one with a global route) ---
-INTERFACE=$(ip -6 route show default | awk '{print $7; exit}')
-
-if [ -z "$INTERFACE" ]; then
-    echo "Error: No default IPv6 route found"
-    exit 1
-fi
-
-# --- Get the stable global IPv6 address (non-temporary, scope global) ---
-# On Linux, temporary/privacy addresses have the "temporary" flag or are marked deprecated
-IP=$(ip -6 addr show dev "$INTERFACE" scope global \
-     | awk '/inet6/ {print $2}' \
-     | cut -d/ -f1 \
-     | grep -v '^fd' \
-     | grep -v '^fe80' \
-     | grep -v 'temporary' \
-     | head -1)
-
-if [ -z "$IP" ]; then
-    echo "Error: No stable global IPv6 address found on $INTERFACE"
-    exit 1
-fi
-
-
-DOMAIN=k8s.lzadm.com
-# get ipv6 prefix from IP assuming /64
-IPV6PREFIX=$(echo $IP | cut -d: -f1-4)
-# alternative: get ipv6 prefix via router advertisement
-IPV6PREFIXFULL=$(rdisc6 -q $INTERFACE)
-
-echo "$(hostname) details: IPv6 address=$IP, DOMAIN=$DOMAIN, IPV6PREFIX=$IPV6PREFIX , IPV6PREFIXFULL=$IPV6PREFIXFULL"
-
-mkdir -p /etc/rancher/k3s
-cat >/etc/rancher/k3s/config.yaml <<EOL
-node-ip: $IP
-cluster-domain: $DOMAIN
-cluster-cidr: '$IPV6PREFIX:ffcc::/64'
-service-cidr: '$IPV6PREFIX:ff00::/112'
-cluster-dns: '$IPV6PREFIX:ff00::10'
-flannel-backend: none
-disable-network-policy: true
-tls-san:
-  - "ctrl.$DOMAIN"
-disable:
-  - traefik
-EOL
-
-
-echo "Final k3s config."
-cat /etc/rancher/k3s/config.yaml
+# Run the config script before installing k3s
+./debian_vm/scripts/k3s-server-config-set.sh
 ```
+
+The script generates `/etc/rancher/k3s/config.yaml` with:
+- `cluster-cidr: <prefix>:79fd::/64`
+- `service-cidr: <prefix>:79fd:ff00::/112`
+- `cluster-dns: <prefix>:79fd:ff00::10`
 
 ### install k3s
 
@@ -420,11 +401,14 @@ kube-system   metrics-server-7b9c9c4b9c-ghmbf           0/1     ContainerCreatin
 <https://docs.tigera.io/calico/latest/getting-started/kubernetes/k3s/multi-node-install>
 
 ```bash
-#1:
+# Install Calico operator
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/operator-crds.yaml
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/tigera-operator.yaml
 
-#2 set calico config
+# Get the /48 prefix from node IP
+PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
+
+# Configure Calico with IPv6 using 79fd::/64 for pods
 kubectl create -f - <<EOF
 apiVersion: operator.tigera.io/v1
 kind: Installation
@@ -432,58 +416,22 @@ metadata:
   name: default
 spec:
   calicoNetwork:
-    # Note: The ipPools section cannot be modified post-install.
     ipPools:
       - blockSize: 120
-        cidr: $(rdisc6 -q enp2s0 | cut -d: -f1-3):79fc::/64
+        cidr: ${PREFIX_48}:79fd::/64
         encapsulation: None
         natOutgoing: Disabled
         nodeSelector: all()
     nodeAddressAutodetectionV6:
       kubernetes: NodeInternalIP
 EOF
-```
 
-create Calico API server pods
-
-```bash
+# Create Calico API server
 kubectl create -f - <<EOF
 apiVersion: operator.tigera.io/v1
-kind: APIServer 
-metadata: 
-  name: default 
-spec: {}
-EOF
-```
-
-### calico config
-
-```bash
-kubectl create -f - <<EOF
-apiVersion: operator.tigera.io/v1
-kind: Installation
+kind: APIServer
 metadata:
   name: default
-spec:
-  calicoNetwork:
-    # Note: The ipPools section cannot be modified post-install.
-    ipPools:
-      - blockSize: 120
-        cidr: $(rdisc6 -q enp2s0 | cut -d: -f1-3):79fc::/64
-        encapsulation: None
-        natOutgoing: Disabled
-        nodeSelector: all()
-    nodeAddressAutodetectionV6:
-      kubernetes: NodeInternalIP
-EOF
-```
-
-```bash
-kubectl create -f - <<EOF
-apiVersion: operator.tigera.io/v1
-kind: APIServer 
-metadata: 
-  name: default 
 spec: {}
 EOF
 ```
@@ -500,41 +448,92 @@ copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
      server: https://k8s-node01:6443
 ```
 
-### calico BGP peer config
+### Calico BGP Configuration
+
+See [CLAUDE.md](CLAUDE.md) for detailed BGP configuration with password authentication.
 
 ```bash
-kubectl create -f - <<EOF
-apiVersion: projectcalico.org/v3
-kind: BGPPeer
-metadata:
-  name: pfsense
-spec:
-  peerIP: <ipv6 address of BGP router>
-  asNumber: 65101
-EOF
-```
+# Get the /48 prefix
+PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
 
-```bash
+# 1. Configure Calico BGP with custom AS number (65010) and service advertisement
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPConfiguration
 metadata:
   name: default
 spec:
+  asNumber: 65010
   serviceClusterIPs:
-  - cidr: 2001:a61:1162:79fc:ff00::/112
+  - cidr: ${PREFIX_48}:79fd:ff00::/112
+EOF
+
+# 2. Create secret for BGP password
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bgp-secrets
+  namespace: calico-system
+type: Opaque
+stringData:
+  pfsense-password: "<your-bgp-password>"
+EOF
+
+# 3. Create RBAC for calico-node to read the secret
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bgp-secret-access
+  namespace: calico-system
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["bgp-secrets"]
+  verbs: ["watch", "list", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bgp-secret-access
+  namespace: calico-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bgp-secret-access
+subjects:
+- kind: ServiceAccount
+  name: calico-node
+  namespace: calico-system
+EOF
+
+# 4. Add pfSense as BGP peer with password authentication
+kubectl apply -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: pfsense
+spec:
+  peerIP: <pfsense-ipv6-address>
+  asNumber: 65101
+  password:
+    secretKeyRef:
+      name: bgp-secrets
+      key: pfsense-password
 EOF
 ```
 
 ### coredns check
 
 ```bash
-nslookup metrics-server.kube-system.svc.k8s.lzadm.com 2001:a61:1162:79fc:ff00::10
-Server:		2001:a61:1162:79fc:ff00::10
-Address:	2001:a61:1162:79fc:ff00::10#53
+# Example with prefix 2001:a61:1162 - cluster DNS is at :79fd:ff00::10
+nslookup metrics-server.kube-system.svc.k8s.lzadm.com 2001:a61:1162:79fd:ff00::10
+Server:		2001:a61:1162:79fd:ff00::10
+Address:	2001:a61:1162:79fd:ff00::10#53
 
 Name:	metrics-server.kube-system.svc.k8s.lzadm.com
-Address: 2001:a61:1162:79fc:ff00::c829
+Address: 2001:a61:1162:79fd:ff00::xxxx
 ```
 
 ### uninstall k3s
