@@ -25,20 +25,34 @@ fi
 
 
 DOMAIN=k8s.lzadm.com
-# get ipv6 prefix from IP assuming /64
-IPV6PREFIX=$(echo $IP | cut -d: -f1-4)
+
+# Get first 3 hextets of IPv6 prefix (e.g., 2001:a61:1162)
+# This is the /48 portion that's stable across your /56 delegation
+IPV6PREFIX_48=$(echo $IP | cut -d: -f1-3)
+
+# Subnet allocation from Fritzbox /56 via /63 delegation to pfSense:
+#   79fc::/64 = Host network (nodes get addresses via RA)
+#   79fd::/64 = k3s cluster-cidr (pods)
+# Service CIDR and DNS are within the cluster-cidr /64
+CLUSTER_SUBNET="79fd"
+
 # alternative: get ipv6 prefix via router advertisement
 IPV6PREFIXFULL=$(rdisc6 -q $INTERFACE)
 
-echo "$(hostname) details: IPv6 address=$IP, DOMAIN=$DOMAIN, IPV6PREFIX=$IPV6PREFIX , IPV6PREFIXFULL=$IPV6PREFIXFULL"
+echo "$(hostname) details:"
+echo "  Node IPv6 address: $IP"
+echo "  Cluster domain: $DOMAIN"
+echo "  Prefix /48: $IPV6PREFIX_48"
+echo "  Cluster CIDR: ${IPV6PREFIX_48}:${CLUSTER_SUBNET}::/64"
+echo "  RA prefix: $IPV6PREFIXFULL"
 
 mkdir -p /etc/rancher/k3s
 cat >/etc/rancher/k3s/config.yaml <<EOL
 node-ip: $IP
 cluster-domain: $DOMAIN
-cluster-cidr: '$IPV6PREFIX:ffcc::/64'
-service-cidr: '$IPV6PREFIX:ff00::/112'
-cluster-dns: '$IPV6PREFIX:ff00::10'
+cluster-cidr: '${IPV6PREFIX_48}:${CLUSTER_SUBNET}::/64'
+service-cidr: '${IPV6PREFIX_48}:${CLUSTER_SUBNET}:ff00::/112'
+cluster-dns: '${IPV6PREFIX_48}:${CLUSTER_SUBNET}:ff00::10'
 flannel-backend: none
 disable-network-policy: true
 tls-san:
@@ -47,6 +61,6 @@ disable:
   - traefik
 EOL
 
-
-echo "Final k3s config."
+echo ""
+echo "Final k3s config:"
 cat /etc/rancher/k3s/config.yaml
