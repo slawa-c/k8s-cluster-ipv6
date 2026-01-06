@@ -14,9 +14,10 @@ The main idea is to deploy kubernetes cluster in my home lab in subnet where onl
               ▼
         [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  79e0::/60 (79e0-79ef)
                                   ├──▶ [Unifi UDR7]      79fa::/64
-                                  └──▶ [pfSense]         79fc::/63 (2x /64)
-                                                           ├── 79fc::/64 → host network
-                                                           └── 79fd::/64 → k3s cluster-cidr
+                                  └──▶ [pfSense]         79fb::/64
+                                                           ├── 79fb:0000-ffcb:: → host/node network (RA)
+                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP)
+                                                           └── 79fb:ff00::/112 → k3s services (BGP)
 ```
 
 **BGP AS Numbers:**
@@ -353,9 +354,10 @@ echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 #### k3s-server-config-set.sh
 
 The script is located at `debian_vm/scripts/k3s-server-config-set.sh`. It automatically:
-- Detects the node's IPv6 address from the host network (79fc::/64)
-- Configures cluster-cidr using a separate /64 (79fd::/64)
-- Sets up service CIDR and cluster DNS within the cluster-cidr range
+- Detects the node's IPv6 address and extracts the /48 prefix and 4th hextet
+- Configures cluster-cidr using /112 within the host /64 (79fb:ffcc::/112)
+- Sets up service CIDR and cluster DNS in separate /112 ranges
+- Configures per-node allocation of /120 (256 pod IPs per node)
 
 ```bash
 # Run the config script before installing k3s
@@ -363,9 +365,10 @@ The script is located at `debian_vm/scripts/k3s-server-config-set.sh`. It automa
 ```
 
 The script generates `/etc/rancher/k3s/config.yaml` with:
-- `cluster-cidr: <prefix>:79fd::/64`
-- `service-cidr: <prefix>:79fd:ff00::/112`
-- `cluster-dns: <prefix>:79fd:ff00::10`
+- `cluster-cidr: <prefix>:<4th-hextet>:ffcc::/112`
+- `service-cidr: <prefix>:<4th-hextet>:ff00::/112`
+- `cluster-dns: <prefix>:<4th-hextet>:ff00::10`
+- `node-cidr-mask-size-ipv6: 120` (256 pod IPs per node, max 256 nodes)
 
 ### install k3s
 
@@ -405,10 +408,12 @@ kube-system   metrics-server-7b9c9c4b9c-ghmbf           0/1     ContainerCreatin
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/operator-crds.yaml
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/tigera-operator.yaml
 
-# Get the /48 prefix from node IP
-PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
+# Get the /48 prefix and 4th hextet from node IP
+NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
+PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
+HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
 
-# Configure Calico with IPv6 using 79fd::/64 for pods
+# Configure Calico with IPv6 using /112 cluster-cidr with /120 per-node blocks
 kubectl create -f - <<EOF
 apiVersion: operator.tigera.io/v1
 kind: Installation
@@ -418,7 +423,7 @@ spec:
   calicoNetwork:
     ipPools:
       - blockSize: 120
-        cidr: ${PREFIX_48}:79fd::/64
+        cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
         encapsulation: None
         natOutgoing: Disabled
         nodeSelector: all()
@@ -453,8 +458,10 @@ copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
 See [CLAUDE.md](CLAUDE.md) for detailed BGP configuration with password authentication.
 
 ```bash
-# Get the /48 prefix
-PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
+# Get the /48 prefix and 4th hextet
+NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
+PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
+HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
 
 # 1. Configure Calico BGP with custom AS number (65010) and service advertisement
 kubectl apply -f - <<EOF
@@ -465,7 +472,7 @@ metadata:
 spec:
   asNumber: 65010
   serviceClusterIPs:
-  - cidr: ${PREFIX_48}:79fd:ff00::/112
+  - cidr: ${PREFIX_48}:${HEXTET_4}:ff00::/112
 EOF
 
 # 2. Create secret for BGP password
@@ -527,13 +534,13 @@ EOF
 ### coredns check
 
 ```bash
-# Example with prefix 2001:a61:1162 - cluster DNS is at :79fd:ff00::10
-nslookup metrics-server.kube-system.svc.k8s.lzadm.com 2001:a61:1162:79fd:ff00::10
-Server:		2001:a61:1162:79fd:ff00::10
-Address:	2001:a61:1162:79fd:ff00::10#53
+# Example with prefix 2001:a61:1162:79fb - cluster DNS is at :ff00::10
+nslookup metrics-server.kube-system.svc.k8s.lzadm.com 2001:a61:1162:79fb:ff00::10
+Server:		2001:a61:1162:79fb:ff00::10
+Address:	2001:a61:1162:79fb:ff00::10#53
 
 Name:	metrics-server.kube-system.svc.k8s.lzadm.com
-Address: 2001:a61:1162:79fd:ff00::xxxx
+Address: 2001:a61:1162:79fb:ff00::xxxx
 ```
 
 ### uninstall k3s

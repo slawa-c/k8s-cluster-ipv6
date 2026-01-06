@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMware Fusion on macOS. The cluster uses DNS64/NAT64 on pfSense for IPv4 connectivity, Calico CNI for networking, and BGP peering with pfSense for service advertisement.
 
 **Key Infrastructure:**
-- **Network:** IPv6-only (2001:a61:1162:79fc::/64 host subnet, 2001:a61:1162:79fd::/64 cluster CIDR)
+- **Network:** IPv6-only (2001:a61:1162:79fb::/64 single subnet with /112 ranges for k8s)
 - **Router:** pfSense with DNS64/NAT64, FRR BGP (AS 65101)
 - **Cluster:** k3s multi-node with Calico CNI, BGP peering (AS 65010)
 - **DNS:** Cluster domain `k8s.lzadm.com`, home domain `home.lzadm.com`
@@ -19,9 +19,10 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
               ▼
         [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  79e0::/60 (79e0-79ef)
                                   ├──▶ [Unifi UDR7]      79fa::/64
-                                  └──▶ [pfSense]         79fc::/63 (2x /64)
-                                                           ├── 79fc::/64 → host network
-                                                           └── 79fd::/64 → k3s cluster-cidr
+                                  └──▶ [pfSense]         79fb::/64
+                                                           ├── 79fb:0000-ffcb:: → host/node network (RA)
+                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP)
+                                                           └── 79fb:ff00::/112 → k3s services (BGP)
 ```
 
 **Subnet Allocation from /56:**
@@ -29,10 +30,11 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
 |--------|------------|-------|
 | 79e0::/60 | Mikrotik hex-s | 16 /64s (79e0-79ef) |
 | 79fa::/64 | Unifi UDR7 | |
-| 79fc::/63 | pfSense | /63 delegation (2x /64) |
-| ├─ 79fc::/64 | pfSense LAN | Host/node network (RA advertised) |
-| └─ 79fd::/64 | k3s cluster-cidr | Pod network (BGP advertised) |
-| 79fe-79ff | Available | Future use |
+| 79fb::/64 | pfSense | Single /64 delegation |
+| ├─ 79fb:0000-ffcb:: | pfSense LAN | Host/node network (RA advertised) |
+| ├─ 79fb:ffcc::/112 | k3s cluster-cidr | Pod network (BGP advertised) |
+| └─ 79fb:ff00::/112 | k3s service-cidr | Service network (BGP advertised) |
+| 79fc-79ff | Available | Future use |
 
 ## Architecture
 
@@ -45,28 +47,22 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
 
 ### IPv6 Network Configuration
 
-**Dual-Subnet Architecture:**
-This setup uses two /64 subnets from a /63 delegation from Fritzbox:
-- `2001:a61:1162:79fc::/64` - Host/node network (advertised via RA)
-- `2001:a61:1162:79fd::/64` - Kubernetes pod network (routed via BGP)
+**Single /64 Subnet Architecture:**
+This setup uses a single /64 subnet from Fritzbox with /112 ranges for k8s:
+- `2001:a61:1162:79fb::/64` - Full /64 allocation from pfSense
+  - `79fb:0000-ffcb::` - Host/node network (advertised via RA)
+  - `79fb:ffcc::/112` - Kubernetes pod network (routed via BGP)
+  - `79fb:ff00::/112` - Kubernetes service network (routed via BGP)
 
-**Why separate subnets?**
-k3s validation prevents cluster-cidr from overlapping with the node network. Attempting to use the same /64 for both results in:
-```
-Error: invalid cluster-cidr ...: invalid CIDR address: ... ...
-```
+**How it works:**
+- pfSense receives single `/64` via DHCPv6-PD from Fritzbox
+- pfSense advertises the full `/64` via Router Advertisements for host network
+- Nodes receive SLAAC addresses from the lower portion of the /64
+- k3s uses `79fb:ffcc::/112` for pods (learned via BGP from Calico)
+- k3s uses `79fb:ff00::/112` for services (learned via BGP from Calico)
+- BGP advertises only the /112 subnets to avoid routing conflicts
 
-**Solution:** Request /63 from Fritzbox via DHCPv6-PD to pfSense:
-- pfSense receives `79fc::/63` (contains 79fc and 79fd)
-- pfSense advertises `79fc::/64` via Router Advertisements for host network
-- pfSense routes `79fd::/64` for k3s cluster-cidr (learned via BGP from Calico)
-
-**Alternative approaches considered:**
-1. **Subdividing single /64** - Not recommended; defeats IPv6's design philosophy of abundant address space
-2. **ULA (fd00::/8) for pods** - Loses direct IPv6 routing; but stable across ISP prefix changes
-3. **Separate /64 subnets** - ✅ Current approach; clean separation, proper IPv6 practice
-
-**Node network (79fc::/64):**
+**Node network:**
 - Nodes use systemd-networkd for IPv6 SLAAC (Stateless Address Autoconfiguration)
 - Global IPv6 addresses obtained via router advertisements from pfSense
 - No static IP assignment - addresses discovered dynamically
@@ -82,20 +78,23 @@ Error: invalid cluster-cidr ...: invalid CIDR address: ... ...
 
 Scripts dynamically determine from the environment:
 - IPv6 prefix (/48) extracted from node address: first 3 hextets (e.g., `2001:a61:1162`)
-- Node network: `<prefix>:79fc::/64` (auto-assigned via RA from pfSense)
-- Cluster CIDR: `<prefix>:79fd::/64` (dedicated /64 for pods)
-- Service CIDR: `<prefix>:79fd:ff00::/112` (within cluster CIDR)
-- Cluster DNS: `<prefix>:79fd:ff00::10`
+- 4th hextet extracted from node address (e.g., `79fb` for host network)
+- Node network: `<prefix>:<4th-hextet>::/64` (auto-assigned via RA from pfSense)
+- Cluster CIDR: `<prefix>:<4th-hextet>:ffcc::/112` (65,536 pod IPs)
+- Service CIDR: `<prefix>:<4th-hextet>:ff00::/112` (65,536 service IPs)
+- Cluster DNS: `<prefix>:<4th-hextet>:ff00::10`
+- Node CIDR allocation: /120 per node (256 pod IPs per node)
 
 **Example with current prefix:**
 ```
-Node address:   2001:a61:1162:79fc:xxxx:xxxx:xxxx:xxxx
-Cluster CIDR:   2001:a61:1162:79fd::/64
-Service CIDR:   2001:a61:1162:79fd:ff00::/112
-Cluster DNS:    2001:a61:1162:79fd:ff00::10
+Node address:   2001:a61:1162:79fb:xxxx:xxxx:xxxx:xxxx
+Cluster CIDR:   2001:a61:1162:79fb:ffcc::/112
+Service CIDR:   2001:a61:1162:79fb:ff00::/112
+Cluster DNS:    2001:a61:1162:79fb:ff00::10
+Per-node CIDR:  /120 (256 pod IPs per node, supports 256 nodes)
 ```
 
-**Important:** The script `k3s-server-config-set.sh` extracts the first 3 hextets from the node's IPv6 address and uses hardcoded fourth hextet `79fd` for cluster-cidr. This ensures the cluster uses a separate /64 from the /63 delegation that doesn't overlap with the host network (79fc).
+**Important:** The script `k3s-server-config-set.sh` extracts the first 4 hextets from the node's IPv6 address to dynamically configure cluster networking. Using /112 for cluster-cidr with /120 per-node allocation provides a balanced approach: 65,536 total pod IPs with 256 IPs per node, supporting up to 256 nodes in the cluster.
 
 ## Prerequisites
 
@@ -227,27 +226,28 @@ rm -rf /var/log/* /tmp/* /var/tmp/*
 **Fritzbox (upstream router):**
 - DHCPv6 Prefix Delegation enabled
 - Must delegate multiple prefixes to downstream routers
-- Current delegations: /60 to Mikrotik, /64 to Unifi, /63 to pfSense
+- Current delegations: /60 to Mikrotik, /64 to Unifi, /64 to pfSense
 
 **pfSense router must have:**
-- **DHCPv6-PD client** configured on WAN to request /63 from Fritzbox
-- **Two /64 subnets** from the /63 delegation:
-  - 79fc::/64 for host network (advertised via RA)
-  - 79fd::/64 for k3s cluster-cidr (routed, NOT advertised via RA)
-- IPv6 Router Advertisements enabled only for host subnet (79fc)
+- **DHCPv6-PD client** configured on WAN to request /64 from Fritzbox
+- **Single /64 subnet** for both host network and cluster traffic:
+  - 79fb::/64 for host network (advertised via RA)
+  - 79fb:ffcc::/112 for k3s cluster-cidr (routed via BGP, NOT advertised via RA)
+  - 79fb:ff00::/112 for k3s service-cidr
+- IPv6 Router Advertisements enabled for host subnet
 - DNS64/NAT64 configured for IPv4 reachability from IPv6-only hosts
 - BIND9 running on port 5353 for dynamic DNS updates
 - FRR package installed and configured for BGP (AS 65101)
 - BGP peer group configured to accept connections from k8s nodes (AS 65010)
-- **BGP learns routes** for cluster CIDR subnet (79fd::/64) from Calico
+- **BGP learns routes** for cluster CIDR subnet (79fb:ffcc::/112) from Calico
 
 **pfSense DHCPv6-PD Configuration:**
 1. Interfaces → WAN → IPv6 Configuration Type: DHCPv6
 2. DHCPv6 Client Configuration:
-   - Prefix Delegation Size: /63 (gives 79fc + 79fd)
+   - Prefix Delegation Size: /64
    - Send IPv6 prefix hint: Enabled
-3. Interfaces → LAN → Track Interface → WAN with Prefix ID: 0 (for 79fc)
-4. 79fd::/64 is routed automatically via BGP from k3s/Calico nodes
+3. Interfaces → LAN → Track Interface → WAN with Prefix ID: 0
+4. 79fb:ffcc::/112 is routed automatically via BGP from k3s/Calico nodes
 
 **VMware Fusion configuration:**
 - VMs must use bridged networking to access the IPv6 home network
@@ -309,10 +309,12 @@ curl -sfL https://get.k3s.io | K3S_TOKEN=supersecret! sh -s - agent --server htt
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/operator-crds.yaml
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/tigera-operator.yaml
 
-# Get the /48 prefix from node IP (first 3 hextets)
-PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
+# Get the /48 prefix and 4th hextet from node IP
+NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
+PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
+HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
 
-# Configure Calico with IPv6 using 79fd::/64 for pods
+# Configure Calico with IPv6 using /112 cluster-cidr with /120 per-node blocks
 kubectl create -f - <<EOF
 apiVersion: operator.tigera.io/v1
 kind: Installation
@@ -322,7 +324,7 @@ spec:
   calicoNetwork:
     ipPools:
       - blockSize: 120
-        cidr: ${PREFIX_48}:79fd::/64
+        cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
         encapsulation: None
         natOutgoing: Disabled
         nodeSelector: all()
@@ -349,8 +351,10 @@ BGP AS Numbers:
 | k3s/Calico | 65010 |
 
 ```bash
-# Get the /48 prefix
-PREFIX_48=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | head -1 | cut -d: -f1-3)
+# Get the /48 prefix and 4th hextet
+NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
+PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
+HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
 
 # 1. Configure Calico BGP with custom AS number and service advertisement
 kubectl apply -f - <<EOF
@@ -361,7 +365,7 @@ metadata:
 spec:
   asNumber: 65010
   serviceClusterIPs:
-  - cidr: ${PREFIX_48}:79fd:ff00::/112
+  - cidr: ${PREFIX_48}:${HEXTET_4}:ff00::/112
 EOF
 
 # 2. Create secret for BGP password (must be in calico-system namespace)

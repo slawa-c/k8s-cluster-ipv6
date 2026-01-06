@@ -30,11 +30,20 @@ DOMAIN=k8s.lzadm.com
 # This is the /48 portion that's stable across your /56 delegation
 IPV6PREFIX_48=$(echo $IP | cut -d: -f1-3)
 
-# Subnet allocation from Fritzbox /56 via /63 delegation to pfSense:
-#   79fc::/64 = Host network (nodes get addresses via RA)
-#   79fd::/64 = k3s cluster-cidr (pods)
-# Service CIDR and DNS are within the cluster-cidr /64
-CLUSTER_SUBNET="79fd"
+# Get 4th hextet from node IP (e.g., 79fb for host network)
+# This identifies which /64 subnet the node is on
+IPV6_4TH_HEXTET=$(echo $IP | cut -d: -f4)
+
+# Subnet allocation from Fritzbox /56 via pfSense:
+#   79fb::/64 = Host network (nodes get addresses via RA)
+#   79fb:ffcc::/112 = k3s cluster-cidr (pods) - allows 256 /120 blocks
+#   79fb:ff00::/112 = k3s service-cidr - 65,536 service IPs
+# Using /112 cluster-cidr with /120 per-node allocation:
+#   - Total pod IPs: 65,536 addresses
+#   - Per node: /120 = 256 addresses
+#   - Max nodes: 256 nodes
+CLUSTER_POD_SUBNET="ffcc"
+CLUSTER_SVC_SUBNET="ff00"
 
 # alternative: get ipv6 prefix via router advertisement
 IPV6PREFIXFULL=$(rdisc6 -q $INTERFACE)
@@ -43,20 +52,26 @@ echo "$(hostname) details:"
 echo "  Node IPv6 address: $IP"
 echo "  Cluster domain: $DOMAIN"
 echo "  Prefix /48: $IPV6PREFIX_48"
-echo "  Cluster CIDR: ${IPV6PREFIX_48}:${CLUSTER_SUBNET}::/64"
+echo "  Host network: ${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}::/64"
+echo "  Cluster CIDR: ${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}:${CLUSTER_POD_SUBNET}::/112"
+echo "  Service CIDR: ${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}:${CLUSTER_SVC_SUBNET}::/112"
+echo "  Per-node allocation: /120 (256 pod IPs per node, max 256 nodes)"
 echo "  RA prefix: $IPV6PREFIXFULL"
 
 mkdir -p /etc/rancher/k3s
 cat >/etc/rancher/k3s/config.yaml <<EOL
 node-ip: $IP
 cluster-domain: $DOMAIN
-cluster-cidr: '${IPV6PREFIX_48}:${CLUSTER_SUBNET}::/64'
-service-cidr: '${IPV6PREFIX_48}:${CLUSTER_SUBNET}:ff00::/112'
-cluster-dns: '${IPV6PREFIX_48}:${CLUSTER_SUBNET}:ff00::10'
+cluster-cidr: '${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}:${CLUSTER_POD_SUBNET}::/112'
+service-cidr: '${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}:${CLUSTER_SVC_SUBNET}::/112'
+cluster-dns: '${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}:${CLUSTER_SVC_SUBNET}::10'
 flannel-backend: none
 disable-network-policy: true
+kube-controller-manager-arg:
+  - node-cidr-mask-size-ipv6=120
 tls-san:
   - "ctrl.$DOMAIN"
+  - "k3s-cluster.$DOMAIN"
 disable:
   - traefik
 EOL
