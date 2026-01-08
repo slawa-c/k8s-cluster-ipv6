@@ -447,14 +447,15 @@ kubectl --server=https://k8s-cluster.k8s.lzadm.com:6443 get nodes
 
 ## Quick Reference
 
-### MetalLB VIP Allocation
+### Network Allocation
 
 ```
-Full /64:        2001:a61:1162:79fb::/64
-├── Host network: 2001:a61:1162:79fb:0000-ffcb::
-├── Pod CIDR:     2001:a61:1162:79fb:ffcc::/112
-├── Service CIDR: 2001:a61:1162:79fb:ff00::/112
-└── API VIP:      2001:a61:1162:79fb:ff00::100/128  ← MetalLB
+Full /64:              2001:a61:1162:79fb::/64
+├── Host network:      2001:a61:1162:79fb:0000-ffcb::  (RA advertised)
+├── Pod CIDR:          2001:a61:1162:79fb:ffcc::/112   (Calico IPAM)
+├── ClusterIP CIDR:    2001:a61:1162:79fb:ff00::/112   (k3s services)
+│   └── Cluster DNS:   2001:a61:1162:79fb:ff00::10
+└── LoadBalancer CIDR: 2001:a61:1162:79fb:ff01::/112   (MetalLB pool)
 ```
 
 ### DNS Names
@@ -465,7 +466,7 @@ Full /64:        2001:a61:1162:79fb::/64
 | k8s-node02.k8s.lzadm.com | Individual node | AAAA |
 | k8s-node03.k8s.lzadm.com | Individual node | AAAA |
 | k8s-cluster.k8s.lzadm.com | Round-robin all nodes | AAAA (×3) |
-| k8s-api.k8s.lzadm.com | MetalLB VIP | AAAA |
+| k8s-api.k8s.lzadm.com | MetalLB LoadBalancer VIP | AAAA (ff01::x) |
 
 ### AS Numbers
 
@@ -478,17 +479,17 @@ Full /64:        2001:a61:1162:79fb::/64
 
 ## Appendix: Complete MetalLB + Calico Integration
 
-This section provides the complete, copy-paste ready configuration for integrating MetalLB with the existing Calico BGP setup.
+This section provides the complete, copy-paste ready configuration for integrating MetalLB with Calico BGP. MetalLB handles IP allocation only (controller), while Calico handles all BGP advertisement to pfSense.
 
 ### Current Environment
 
 ```
-Network:      2001:a61:1162:79fb::/64
-Pod CIDR:     2001:a61:1162:79fb:ffcc::/112
-Service CIDR: 2001:a61:1162:79fb:ff00::/112
-Calico AS:    65010
-pfSense AS:   65101
-API VIP:      2001:a61:1162:79fb:ff00::100
+Network:           2001:a61:1162:79fb::/64
+Pod CIDR:          2001:a61:1162:79fb:ffcc::/112
+Service CIDR:      2001:a61:1162:79fb:ff00::/112  (ClusterIP)
+LoadBalancer CIDR: 2001:a61:1162:79fb:ff01::/112  (MetalLB pool)
+Calico AS:         65010
+pfSense AS:        65101
 ```
 
 ### Architecture After Integration
@@ -497,15 +498,15 @@ API VIP:      2001:a61:1162:79fb:ff00::100
 ┌────────────────────────────────────────────────────────────────┐
 │                    pfSense (AS 65101)                          │
 │                                                                │
-│  BGP Routes from Calico:                                       │
+│  BGP Routes from Calico (external peer only):                  │
 │  ├── 2001:a61:1162:79fb:ffcc::/120  (node01 pods)             │
 │  ├── 2001:a61:1162:79fb:ffcc::/120  (node02 pods)             │
-│  ├── 2001:a61:1162:79fb:ff00::/112  (service CIDR)            │
-│  └── 2001:a61:1162:79fb:ff00::100   (API VIP) ← NEW           │
+│  ├── 2001:a61:1162:79fb:ff00::/112  (ClusterIP services)      │
+│  └── 2001:a61:1162:79fb:ff01::/112  (LoadBalancer IPs)  ← NEW │
 └────────────────────────────────────────────────────────────────┘
                           │
-                          │ Single BGP session per node
-                          │ (Calico handles everything)
+                          │ BGP (external peer only)
+                          │ Node-to-node mesh DISABLED
                           │
         ┌─────────────────┼─────────────────┐
         │                 │                 │
@@ -515,95 +516,128 @@ API VIP:      2001:a61:1162:79fb:ff00::100
   │           │    │           │    │           │
   │ Calico    │    │ Calico    │    │ Calico    │
   │ (AS 65010)│    │ (AS 65010)│    │ (AS 65010)│
+  │ + BGPFilter    │ + BGPFilter    │ + BGPFilter    │
   │           │    │           │    │           │
   │ MetalLB   │    │ MetalLB   │    │ MetalLB   │
-  │ (L2 mode) │    │ (L2 mode) │    │ (L2 mode) │
+  │(controller)│   │    ---    │    │    ---    │
   │           │    │           │    │           │
   │ API :6443 │    │ API :6443 │    │ API :6443 │
   └───────────┘    └───────────┘    └───────────┘
 ```
 
-**Key:** MetalLB runs in L2 mode for IP assignment, Calico advertises the VIP via BGP. No BGP conflicts because only Calico peers with pfSense.
+**Key Points:**
+- MetalLB runs **controller only** (no speaker) - handles IP allocation from pool
+- Calico handles **all BGP advertisement** to pfSense
+- **Node-to-node mesh disabled** - only external BGP peer to pfSense
+- **BGPFilter** blocks LoadBalancer CIDR from internal routes (if mesh re-enabled)
+- **externalTrafficPolicy: Local** preserves source IP
 
-### Step 1: Install MetalLB (FRR Mode for IPv6)
+### Step 1: Install MetalLB Controller Only (v0.15.3)
 
 ```bash
-# Install MetalLB with FRR backend
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-frr.yaml
+# Install MetalLB native manifest (latest v0.15.3)
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.15.3/config/manifests/metallb-native.yaml
 
 # Wait for controller to be ready
 kubectl wait --namespace metallb-system \
   --for=condition=ready pod \
   --selector=component=controller \
   --timeout=120s
+
+# Remove the speaker DaemonSet - Calico handles BGP
+kubectl delete daemonset speaker -n metallb-system
+
+# Verify only controller is running
+kubectl get pods -n metallb-system
+# Should show: controller-xxx only, no speaker pods
 ```
 
-### Step 2: Create API VIP Address Pool
+### Step 2: Create LoadBalancer IP Address Pool
 
 ```yaml
-# metallb-api-pool.yaml
+# metallb-pool.yaml
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
-  name: api-vip-pool
+  name: loadbalancer-pool
   namespace: metallb-system
 spec:
   addresses:
-  # Use an IP from service CIDR range for API VIP
-  # Choosing ::100 to avoid conflicts with cluster DNS (::10)
-  - "2001:a61:1162:79fb:ff00::100/128"
-  autoAssign: false
----
-# L2 Advertisement for local subnet
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: api-vip-l2
-  namespace: metallb-system
-spec:
-  ipAddressPools:
-  - api-vip-pool
+  # Dedicated /112 subnet for LoadBalancer IPs
+  # Separate from ClusterIP service CIDR (ff00::/112)
+  - "2001:a61:1162:79fb:ff01::/112"
+  autoAssign: true
 ```
 
 Apply:
 ```bash
-kubectl apply -f metallb-api-pool.yaml
+kubectl apply -f metallb-pool.yaml
 ```
+
+**Note:** No L2Advertisement or BGPAdvertisement needed - Calico handles BGP.
 
 ### Step 3: Update Calico BGPConfiguration
 
-This is the key integration step - Calico advertises the MetalLB VIP via BGP:
+Disable node-to-node mesh and configure LoadBalancer IP advertisement:
 
 ```yaml
-# calico-bgp-config-updated.yaml
+# calico-bgp-config.yaml
 apiVersion: projectcalico.org/v3
 kind: BGPConfiguration
 metadata:
   name: default
 spec:
   asNumber: 65010
-  # Existing: advertise ClusterIP services
+  logSeverityScreen: Info
+  # IMPORTANT: Disable node-to-node mesh
+  # All routing goes through pfSense as route reflector
+  nodeToNodeMeshEnabled: false
+  # Advertise ClusterIP services
   serviceClusterIPs:
   - cidr: 2001:a61:1162:79fb:ff00::/112
-  # NEW: advertise MetalLB LoadBalancer IPs
-  serviceExternalIPs:
-  - cidr: 2001:a61:1162:79fb:ff00::100/128
-  # Optional: advertise all LoadBalancer services automatically
+  # Advertise LoadBalancer IPs (MetalLB pool)
   serviceLoadBalancerIPs:
-  - cidr: 2001:a61:1162:79fb:ff00::/112
+  - cidr: 2001:a61:1162:79fb:ff01::/112
 ```
 
 Apply:
 ```bash
-kubectl apply -f calico-bgp-config-updated.yaml
+kubectl apply -f calico-bgp-config.yaml
 ```
 
-### Step 4: Verify Existing BGP Peer (No Changes Needed)
+### Step 4: Create BGPFilter for Internal Sessions
 
-Your existing BGP peer configuration remains unchanged:
+Block LoadBalancer CIDR from being advertised on internal BGP sessions (if node-to-node mesh is ever re-enabled or for explicit node peering):
 
 ```yaml
-# Existing - no changes needed
+# calico-bgp-filter.yaml
+apiVersion: projectcalico.org/v3
+kind: BGPFilter
+metadata:
+  name: block-lb-internal
+spec:
+  # Block LoadBalancer CIDR from being exported to internal peers
+  exportV6:
+  - action: Reject
+    cidr: 2001:a61:1162:79fb:ff01::/112
+    matchOperator: In
+  # Allow all other routes
+  - action: Accept
+    matchOperator: NotIn
+    cidr: 0::/0
+```
+
+Apply:
+```bash
+calicoctl apply -f calico-bgp-filter.yaml
+```
+
+### Step 5: Configure BGP Peer to pfSense (with filter)
+
+Update the BGP peer to pfSense - this is the only external peer:
+
+```yaml
+# calico-bgp-peer-pfsense.yaml
 apiVersion: projectcalico.org/v3
 kind: BGPPeer
 metadata:
@@ -611,13 +645,20 @@ metadata:
 spec:
   peerIP: <pfsense-ipv6-address>
   asNumber: 65101
+  # No filter applied - advertise everything to pfSense
+  # (LoadBalancer IPs will be advertised here)
   password:
     secretKeyRef:
       name: bgp-secrets
       key: pfsense-password
 ```
 
-### Step 5: Update k3s TLS SAN
+Apply:
+```bash
+calicoctl apply -f calico-bgp-peer-pfsense.yaml
+```
+
+### Step 6: Update k3s TLS SAN
 
 On **each server node**, update `/etc/rancher/k3s/config.yaml`:
 
@@ -628,7 +669,7 @@ tls-san:
   - "k8s-node02"
   - "k8s-node03"
   - "k8s-cluster.k8s.lzadm.com"
-  - "2001:a61:1162:79fb:ff00::100"  # MetalLB VIP
+  - "2001:a61:1162:79fb:ff01::1"  # Example API VIP from new pool
 ```
 
 Then restart k3s on each server:
@@ -636,23 +677,21 @@ Then restart k3s on each server:
 systemctl restart k3s
 ```
 
-### Step 6: Create API LoadBalancer Service
-
-Option A - Simple LoadBalancer (if you have an endpoint controller):
+### Step 7: Create LoadBalancer Service (externalTrafficPolicy: Local)
 
 ```yaml
-# api-loadbalancer-simple.yaml
+# api-loadbalancer.yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: kubernetes-api-vip
   namespace: default
   annotations:
-    metallb.universe.tf/address-pool: api-vip-pool
-    metallb.universe.tf/loadBalancerIPs: "2001:a61:1162:79fb:ff00::100"
+    metallb.universe.tf/address-pool: loadbalancer-pool
 spec:
   type: LoadBalancer
-  loadBalancerIP: "2001:a61:1162:79fb:ff00::100"
+  # IMPORTANT: Local preserves source IP, traffic only to nodes with pods
+  externalTrafficPolicy: Local
   ipFamilies:
   - IPv6
   ipFamilyPolicy: SingleStack
@@ -662,80 +701,37 @@ spec:
     targetPort: 6443
     protocol: TCP
   selector:
-    # Empty - endpoints managed separately
+    # For API server, you may need EndpointSlice approach
+    # or point to a deployment that proxies to API
 ```
 
-Option B - With EndpointSlice (explicit node endpoints):
+**externalTrafficPolicy Comparison:**
 
-```yaml
-# api-loadbalancer-endpoints.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: kubernetes-api-vip
-  namespace: default
-  annotations:
-    metallb.universe.tf/address-pool: api-vip-pool
-spec:
-  type: LoadBalancer
-  loadBalancerIP: "2001:a61:1162:79fb:ff00::100"
-  ipFamilies:
-  - IPv6
-  ipFamilyPolicy: SingleStack
-  ports:
-  - name: https
-    port: 6443
-    targetPort: 6443
-    protocol: TCP
-  clusterIP: None  # Headless
----
-apiVersion: discovery.k8s.io/v1
-kind: EndpointSlice
-metadata:
-  name: kubernetes-api-vip-endpoints
-  namespace: default
-  labels:
-    kubernetes.io/service-name: kubernetes-api-vip
-addressType: IPv6
-ports:
-- name: https
-  port: 6443
-  protocol: TCP
-endpoints:
-- addresses:
-  - "2001:a61:1162:79fb:xxxx:xxxx:xxxx:1"  # k8s-node01 IPv6
-  conditions:
-    ready: true
-- addresses:
-  - "2001:a61:1162:79fb:xxxx:xxxx:xxxx:2"  # k8s-node02 IPv6
-  conditions:
-    ready: true
-- addresses:
-  - "2001:a61:1162:79fb:xxxx:xxxx:xxxx:3"  # k8s-node03 IPv6
-  conditions:
-    ready: true
-```
+| Policy | Source IP | Load Distribution | Extra Hops |
+|--------|-----------|-------------------|------------|
+| Cluster | Masked (SNAT) | Even across all pods | Possible |
+| Local | Preserved | Only nodes with pods | None |
 
-**Note:** Replace `xxxx:xxxx:xxxx:1`, etc. with actual node IPv6 addresses.
+**Recommendation:** Use `Local` for source IP preservation and direct routing.
 
-### Step 7: Add DNS Entry for VIP
+### Step 8: Add DNS Entry for VIP
 
 Using nsupdate:
 ```bash
 nsupdate -p 5353 << EOF
 server <pfsense-ipv6>
 zone k8s.lzadm.com
-update add k8s-api.k8s.lzadm.com. 300 AAAA 2001:a61:1162:79fb:ff00::100
+update add k8s-api.k8s.lzadm.com. 300 AAAA 2001:a61:1162:79fb:ff01::1
 send
 EOF
 ```
 
 Or add to BIND9 zone file:
 ```
-k8s-api.k8s.lzadm.com.  300  IN  AAAA  2001:a61:1162:79fb:ff00::100
+k8s-api.k8s.lzadm.com.  300  IN  AAAA  2001:a61:1162:79fb:ff01::1
 ```
 
-### Step 8: Update kubeconfig
+### Step 9: Update kubeconfig
 
 ```yaml
 apiVersion: v1
@@ -743,7 +739,7 @@ kind: Config
 clusters:
 - cluster:
     certificate-authority-data: <existing-ca-data>
-    server: https://[2001:a61:1162:79fb:ff00::100]:6443
+    server: https://[2001:a61:1162:79fb:ff01::1]:6443
     # OR: https://k8s-api.k8s.lzadm.com:6443
   name: k3s-ha
 contexts:
@@ -762,65 +758,116 @@ users:
 ### Verification Commands
 
 ```bash
-# 1. Check MetalLB pods
+# 1. Check MetalLB controller only (no speaker)
 kubectl get pods -n metallb-system
+# Expected: controller-xxx Running, NO speaker pods
 
 # 2. Check IP address pool
-kubectl get ipaddresspools -n metallb-system
+kubectl get ipaddresspools -n metallb-system -o yaml
 
-# 3. Check service got the VIP
+# 3. Check LoadBalancer service got an IP
 kubectl get svc kubernetes-api-vip -o wide
+# Should show EXTERNAL-IP from ff01::/112 range
 
-# 4. Check Calico BGP config includes serviceExternalIPs
-kubectl get bgpconfiguration default -o yaml
+# 4. Check Calico BGP config
+calicoctl get bgpconfiguration default -o yaml
+# Verify: nodeToNodeMeshEnabled: false, serviceLoadBalancerIPs set
 
-# 5. Check BGP routes advertised (on a node)
-sudo calicoctl node status
+# 5. Check BGP filter
+calicoctl get bgpfilter block-lb-internal -o yaml
 
-# 6. On pfSense - verify BGP routes
-# In FRR shell:
+# 6. Check BGP peer status
+calicoctl node status
+# Should show: pfSense peer Established, no node-to-node peers
+
+# 7. On pfSense - verify BGP routes in FRR shell:
 show bgp ipv6 unicast
-# Should see: 2001:a61:1162:79fb:ff00::100/128
+# Should see:
+#   2001:a61:1162:79fb:ffcc::/120 (pod routes)
+#   2001:a61:1162:79fb:ff00::/112 (ClusterIP services)
+#   2001:a61:1162:79fb:ff01::/112 (LoadBalancer IPs)
 
-# 7. Test VIP connectivity
-curl -k https://[2001:a61:1162:79fb:ff00::100]:6443/healthz
+# 8. Test LoadBalancer IP connectivity
+curl -k https://[2001:a61:1162:79fb:ff01::1]:6443/healthz
 
-# 8. Test with kubectl
-kubectl --server=https://[2001:a61:1162:79fb:ff00::100]:6443 get nodes
+# 9. Test with kubectl
+kubectl --server=https://[2001:a61:1162:79fb:ff01::1]:6443 get nodes
 ```
 
 ### Troubleshooting
 
-**MetalLB pods not running:**
+**MetalLB controller not assigning IPs:**
 ```bash
-kubectl describe pods -n metallb-system
+kubectl describe svc <service-name>
 kubectl logs -n metallb-system -l component=controller
-```
-
-**VIP not assigned to service:**
-```bash
-kubectl describe svc kubernetes-api-vip
 kubectl get events -n metallb-system
 ```
 
-**BGP route not appearing on pfSense:**
+**BGP routes not appearing on pfSense:**
 ```bash
-# Check Calico is advertising
-sudo calicoctl node status
+# Check Calico node BGP status
+calicoctl node status
 
-# Check BGP peer status
-kubectl get bgppeer -o yaml
+# Check BGP peer is established
+calicoctl get bgppeer -o wide
 
-# Check BGPConfiguration has serviceExternalIPs
-kubectl get bgpconfiguration default -o yaml | grep -A5 serviceExternalIPs
+# Check service has LoadBalancer IP assigned
+kubectl get svc -A -o wide | grep LoadBalancer
+
+# Verify serviceLoadBalancerIPs in BGPConfiguration
+calicoctl get bgpconfiguration default -o yaml | grep -A3 serviceLoadBalancerIPs
+```
+
+**Node-to-node routing broken after disabling mesh:**
+```bash
+# Verify pfSense is advertising routes back to nodes
+# On a k8s node:
+ip -6 route | grep ff
+
+# Check pfSense FRR is redistributing routes
+# In pfSense FRR shell:
+show ipv6 route bgp
+```
+
+**LoadBalancer service stuck in Pending:**
+```bash
+# Check MetalLB controller logs
+kubectl logs -n metallb-system -l component=controller
+
+# Verify IPAddressPool has available addresses
+kubectl get ipaddresspools -n metallb-system -o yaml
+
+# Check service annotations
+kubectl get svc <name> -o yaml | grep -A5 annotations
 ```
 
 **Certificate errors when connecting to VIP:**
 ```bash
 # Verify VIP is in certificate SANs
-openssl s_client -connect [2001:a61:1162:79fb:ff00::100]:6443 </dev/null 2>/dev/null | \
+openssl s_client -connect [2001:a61:1162:79fb:ff01::1]:6443 </dev/null 2>/dev/null | \
   openssl x509 -noout -text | grep -A1 "Subject Alternative Name"
 
-# If VIP missing, restart k3s after updating config.yaml
+# If VIP missing, update config.yaml and restart k3s
 systemctl restart k3s
 ```
+
+### Network Allocation Summary
+
+```
+Full /64:              2001:a61:1162:79fb::/64
+├── Host network:      2001:a61:1162:79fb:0000-ffcb::  (RA advertised)
+├── Pod CIDR:          2001:a61:1162:79fb:ffcc::/112   (Calico IPAM)
+├── ClusterIP CIDR:    2001:a61:1162:79fb:ff00::/112   (k3s services)
+│   └── Cluster DNS:   2001:a61:1162:79fb:ff00::10
+└── LoadBalancer CIDR: 2001:a61:1162:79fb:ff01::/112   (MetalLB pool) ← NEW
+```
+
+### Component Responsibilities
+
+| Component | Responsibility |
+|-----------|----------------|
+| MetalLB Controller | IP allocation from pool to LoadBalancer services |
+| Calico | BGP peering with pfSense, route advertisement |
+| BGPFilter | Block LB CIDR from internal routes |
+| pfSense FRR | External BGP peer, route distribution |
+| k3s | API server, service management |
