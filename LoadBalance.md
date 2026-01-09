@@ -49,13 +49,16 @@ MetalLB in FRR mode provides a virtual IP (VIP) that floats between nodes. When 
 ┌─────────────────────────────────────────────────────────────┐
 │                  pfSense (AS 65101, FRR)                    │
 │                                                             │
-│  BGP Routes Learned:                                        │
-│  - 2001:a61:1162:79fb:ffcc::/112  (pod network - Calico)   │
+│  BGP Routes Learned (after pfsense-export-filter):          │
 │  - 2001:a61:1162:79fb:ff00::/112  (svc network - Calico)   │
 │  - 2001:a61:1162:79fb:ff00::100   (API VIP - Calico)       │
+│                                                             │
+│  FILTERED OUT:                                              │
+│  - 2001:a61:1162:79fb:ffcc::/112  (pod network - rejected) │
 └─────────────────────────────────────────────────────────────┘
                           │
                           │ BGP (AS 65010)
+                          │ + BGPFilter
                           │
         ┌─────────────────┼─────────────────┐
         │                 │                 │
@@ -64,7 +67,7 @@ MetalLB in FRR mode provides a virtual IP (VIP) that floats between nodes. When 
   │k8s-node01 │    │k8s-node02 │    │k8s-node03 │
   │           │    │           │    │           │
   │ Calico    │    │ Calico    │    │ Calico    │
-  │ Speaker   │    │ Speaker   │    │ Speaker   │
+  │+BGPFilter │    │+BGPFilter │    │+BGPFilter │
   │           │    │           │    │           │
   │ API :6443 │    │ API :6443 │    │ API :6443 │
   └───────────┘    └───────────┘    └───────────┘
@@ -85,6 +88,11 @@ MetalLB in FRR mode provides a virtual IP (VIP) that floats between nodes. When 
 **Key:** Have Calico advertise MetalLB LoadBalancer IPs to avoid BGP session conflicts.
 
 Both Calico and MetalLB use BGP, but only one BGP session per source-destination IP pair is allowed. Solution: Configure Calico to advertise MetalLB service IPs.
+
+**BGPFilter Usage:** Use BGPFilter to control which routes are advertised to pfSense:
+- **Reject pod CIDR** (`ffcc::/112`) - pod routes are not needed on pfSense
+- **Accept service CIDR** (`ff00::/112`) - for ClusterIP service access
+- **Accept LoadBalancer IPs** - for external service access (VIP)
 
 ### Installation Steps
 
@@ -131,7 +139,56 @@ spec:
   - cidr: 2001:a61:1162:79fb:ff00::100/128    # MetalLB VIP
 ```
 
-#### 4. Create L2 Advertisement (for local network)
+#### 4. Create BGPFilter to Control Route Advertisements
+
+Create a filter to reject pod CIDR advertisements to pfSense:
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: BGPFilter
+metadata:
+  name: pfsense-export-filter
+spec:
+  exportV6:
+    # Reject pod CIDR advertisements to pfSense
+    - action: Reject
+      matchOperator: In
+      cidr: 2001:a61:1162:79fb:ffcc::/112
+    # Default action is Accept - service CIDR and VIP pass through
+```
+
+Apply the filter:
+```bash
+calicoctl apply -f pfsense-export-filter.yaml
+```
+
+#### 5. Attach Filter to pfSense BGPPeer
+
+Update your existing BGPPeer to pfSense to use the filter:
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: pfsense
+spec:
+  peerIP: <pfsense-ipv6-address>
+  asNumber: 65101
+  password:
+    secretKeyRef:
+      name: bgp-secrets
+      key: pfsense-password
+  # Attach the filter
+  filters:
+    - pfsense-export-filter
+```
+
+Apply:
+```bash
+calicoctl apply -f bgppeer-pfsense.yaml
+```
+
+#### 6. Create L2 Advertisement (for local network)
 
 ```yaml
 apiVersion: metallb.io/v1beta1
@@ -144,7 +201,7 @@ spec:
   - control-plane-pool
 ```
 
-#### 5. Update k3s TLS SAN
+#### 7. Update k3s TLS SAN
 
 Add to `/etc/rancher/k3s/config.yaml` on ALL server nodes before installation:
 
@@ -163,7 +220,7 @@ If k3s is already installed, update config and restart:
 systemctl restart k3s
 ```
 
-#### 6. Create LoadBalancer Service for API Server
+#### 8. Create LoadBalancer Service for API Server
 
 ```yaml
 apiVersion: v1
@@ -185,7 +242,7 @@ spec:
   # created by the kubernetes service in the default namespace
 ```
 
-#### 7. Add DNS Entry for VIP
+#### 9. Add DNS Entry for VIP
 
 Add to pfSense BIND9 zone:
 
@@ -193,7 +250,7 @@ Add to pfSense BIND9 zone:
 k8s-api.k8s.lzadm.com.  300  IN  AAAA  2001:a61:1162:79fb:ff00::100
 ```
 
-#### 8. Update kubeconfig
+#### 10. Update kubeconfig
 
 ```yaml
 apiVersion: v1
@@ -214,9 +271,22 @@ kubectl get pods -n metallb-system
 # Check IP address assignment
 kubectl get svc kubernetes-api-lb -o wide
 
-# Check BGP routes on pfSense
-# In pfSense FRR shell:
+# Check BGPFilter is applied
+calicoctl get bgpfilter pfsense-export-filter -o yaml
+
+# Check BGPPeer has filter attached
+calicoctl get bgppeer pfsense -o yaml | grep -A2 filters
+
+# Check BGP peer status
+calicoctl node status
+
+# Check BGP routes on pfSense (In pfSense FRR shell)
 show bgp ipv6 unicast
+# Should see:
+#   - 2001:a61:1162:79fb:ff00::/112 (service CIDR)
+#   - 2001:a61:1162:79fb:ff00::100 (VIP)
+# Should NOT see:
+#   - 2001:a61:1162:79fb:ffcc::/112 (pod CIDR - filtered)
 
 # Test connectivity to VIP
 curl -k https://[2001:a61:1162:79fb:ff00::100]:6443/healthz
@@ -498,14 +568,16 @@ pfSense AS:        65101
 ┌────────────────────────────────────────────────────────────────┐
 │                    pfSense (AS 65101)                          │
 │                                                                │
-│  BGP Routes from Calico (external peer only):                  │
-│  ├── 2001:a61:1162:79fb:ffcc::/120  (node01 pods)             │
-│  ├── 2001:a61:1162:79fb:ffcc::/120  (node02 pods)             │
+│  BGP Routes from Calico (after pfsense-export-filter):         │
 │  ├── 2001:a61:1162:79fb:ff00::/112  (ClusterIP services)      │
-│  └── 2001:a61:1162:79fb:ff01::/112  (LoadBalancer IPs)  ← NEW │
+│  └── 2001:a61:1162:79fb:ff01::/112  (LoadBalancer IPs)        │
+│                                                                │
+│  FILTERED OUT (rejected by pfsense-export-filter):             │
+│  └── 2001:a61:1162:79fb:ffcc::/120  (pod routes)              │
 └────────────────────────────────────────────────────────────────┘
                           │
                           │ BGP (external peer only)
+                          │ + pfsense-export-filter
                           │ Node-to-node mesh DISABLED
                           │
         ┌─────────────────┼─────────────────┐
@@ -516,7 +588,8 @@ pfSense AS:        65101
   │           │    │           │    │           │
   │ Calico    │    │ Calico    │    │ Calico    │
   │ (AS 65010)│    │ (AS 65010)│    │ (AS 65010)│
-  │ + BGPFilter    │ + BGPFilter    │ + BGPFilter    │
+  │           │    │           │    │           │
+  │ BGPFilters│    │ BGPFilters│    │ BGPFilters│
   │           │    │           │    │           │
   │ MetalLB   │    │ MetalLB   │    │ MetalLB   │
   │(controller)│   │    ---    │    │    ---    │
@@ -529,7 +602,8 @@ pfSense AS:        65101
 - MetalLB runs **controller only** (no speaker) - handles IP allocation from pool
 - Calico handles **all BGP advertisement** to pfSense
 - **Node-to-node mesh disabled** - only external BGP peer to pfSense
-- **BGPFilter** blocks LoadBalancer CIDR from internal routes (if mesh re-enabled)
+- **pfsense-export-filter** - rejects pod CIDR to pfSense, accepts service/LB CIDRs
+- **internal-lb-filter** - rejects LB CIDR from internal node-to-node routes
 - **externalTrafficPolicy: Local** preserves source IP
 
 ### Step 1: Install MetalLB Controller Only (v0.15.3)
@@ -605,36 +679,93 @@ Apply:
 kubectl apply -f calico-bgp-config.yaml
 ```
 
-### Step 4: Create BGPFilter for Internal Sessions
+### Step 4: Create BGPFilters
 
-Block LoadBalancer CIDR from being advertised on internal BGP sessions (if node-to-node mesh is ever re-enabled or for explicit node peering):
+BGPFilter resources control which routes are imported/exported between BGP peers. Rules are evaluated sequentially - the first matching rule's action is taken. Default action is **Accept** if no rules match.
+
+#### 4a. Filter for pfSense (External Peer)
+
+Reject pod CIDR from being advertised to pfSense, allow everything else (services, LoadBalancer IPs):
 
 ```yaml
-# calico-bgp-filter.yaml
+# calico-bgp-filter-pfsense.yaml
 apiVersion: projectcalico.org/v3
 kind: BGPFilter
 metadata:
-  name: block-lb-internal
+  name: pfsense-export-filter
 spec:
-  # Block LoadBalancer CIDR from being exported to internal peers
   exportV6:
-  - action: Reject
-    cidr: 2001:a61:1162:79fb:ff01::/112
-    matchOperator: In
-  # Allow all other routes
-  - action: Accept
-    matchOperator: NotIn
-    cidr: 0::/0
+    # Reject pod CIDR advertisements to pfSense
+    - action: Reject
+      matchOperator: In
+      cidr: 2001:a61:1162:79fb:ffcc::/112
+    # Default action is Accept - ClusterIP and LoadBalancer CIDRs pass through
 ```
 
 Apply:
 ```bash
-calicoctl apply -f calico-bgp-filter.yaml
+calicoctl apply -f calico-bgp-filter-pfsense.yaml
 ```
+
+#### 4b. Filter for Internal BGP (Node-to-Node)
+
+Block LoadBalancer CIDR from being advertised between cluster nodes:
+
+```yaml
+# calico-bgp-filter-internal.yaml
+apiVersion: projectcalico.org/v3
+kind: BGPFilter
+metadata:
+  name: internal-lb-filter
+spec:
+  exportV6:
+    # Reject LoadBalancer CIDR from internal node-to-node advertisements
+    - action: Reject
+      matchOperator: In
+      cidr: 2001:a61:1162:79fb:ff01::/112
+    # Default action is Accept - pod routes pass through
+```
+
+Apply:
+```bash
+calicoctl apply -f calico-bgp-filter-internal.yaml
+```
+
+#### 4c. Apply Filter to Internal BGP Peers
+
+**Important:** BGPFilters can only be applied to explicit BGPPeer resources via the `filters` field. The automatic node-to-node mesh does not support filters.
+
+To apply filters to internal BGP:
+1. Disable the automatic node-to-node mesh (done in Step 3)
+2. Create explicit BGPPeer with `nodeSelector` + `peerSelector`
+3. Attach filters to the BGPPeer
+
+```yaml
+# calico-bgp-peer-internal.yaml
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: internal-node-mesh
+spec:
+  # All nodes participate
+  nodeSelector: all()
+  # Peer with all other nodes
+  peerSelector: all()
+  # Apply the internal filter
+  filters:
+    - internal-lb-filter
+```
+
+Apply:
+```bash
+calicoctl apply -f calico-bgp-peer-internal.yaml
+```
+
+**Note:** With `nodeToNodeMeshEnabled: false` and pfSense as the only external peer, internal node peering may not be needed if pfSense acts as a route reflector. Only create this peer if you need direct node-to-node BGP sessions.
 
 ### Step 5: Configure BGP Peer to pfSense (with filter)
 
-Update the BGP peer to pfSense - this is the only external peer:
+Update the BGP peer to pfSense with the export filter attached:
 
 ```yaml
 # calico-bgp-peer-pfsense.yaml
@@ -645,18 +776,24 @@ metadata:
 spec:
   peerIP: <pfsense-ipv6-address>
   asNumber: 65101
-  # No filter applied - advertise everything to pfSense
-  # (LoadBalancer IPs will be advertised here)
   password:
     secretKeyRef:
       name: bgp-secrets
       key: pfsense-password
+  # Apply filter to control route advertisements
+  filters:
+    - pfsense-export-filter
 ```
 
 Apply:
 ```bash
 calicoctl apply -f calico-bgp-peer-pfsense.yaml
 ```
+
+**Routes advertised to pfSense after filter:**
+- ClusterIP CIDR: `2001:a61:1162:79fb:ff00::/112` (Accepted)
+- LoadBalancer CIDR: `2001:a61:1162:79fb:ff01::/112` (Accepted)
+- Pod CIDR: `2001:a61:1162:79fb:ffcc::/112` (Rejected by filter)
 
 ### Step 6: Update k3s TLS SAN
 
@@ -773,8 +910,10 @@ kubectl get svc kubernetes-api-vip -o wide
 calicoctl get bgpconfiguration default -o yaml
 # Verify: nodeToNodeMeshEnabled: false, serviceLoadBalancerIPs set
 
-# 5. Check BGP filter
-calicoctl get bgpfilter block-lb-internal -o yaml
+# 5. Check BGP filters
+calicoctl get bgpfilter -o wide
+calicoctl get bgpfilter pfsense-export-filter -o yaml
+calicoctl get bgpfilter internal-lb-filter -o yaml
 
 # 6. Check BGP peer status
 calicoctl node status
@@ -782,10 +921,11 @@ calicoctl node status
 
 # 7. On pfSense - verify BGP routes in FRR shell:
 show bgp ipv6 unicast
-# Should see:
-#   2001:a61:1162:79fb:ffcc::/120 (pod routes)
+# Should see (after BGPFilter applied):
 #   2001:a61:1162:79fb:ff00::/112 (ClusterIP services)
 #   2001:a61:1162:79fb:ff01::/112 (LoadBalancer IPs)
+# Should NOT see (filtered by pfsense-export-filter):
+#   2001:a61:1162:79fb:ffcc::/120 (pod routes - rejected)
 
 # 8. Test LoadBalancer IP connectivity
 curl -k https://[2001:a61:1162:79fb:ff01::1]:6443/healthz
@@ -868,6 +1008,20 @@ Full /64:              2001:a61:1162:79fb::/64
 |-----------|----------------|
 | MetalLB Controller | IP allocation from pool to LoadBalancer services |
 | Calico | BGP peering with pfSense, route advertisement |
-| BGPFilter | Block LB CIDR from internal routes |
+| BGPFilter: pfsense-export-filter | Block Pod CIDR from pfSense advertisements |
+| BGPFilter: internal-lb-filter | Block LB CIDR from internal node-to-node routes |
 | pfSense FRR | External BGP peer, route distribution |
 | k3s | API server, service management |
+
+### BGPFilter Reference
+
+| Filter Name | Applied To | Action | CIDR |
+|-------------|------------|--------|------|
+| pfsense-export-filter | BGPPeer: pfsense | Reject export | ffcc::/112 (pods) |
+| internal-lb-filter | BGPPeer: internal-node-mesh | Reject export | ff01::/112 (LB) |
+
+**BGPFilter Rule Evaluation:**
+1. Rules are evaluated sequentially (top to bottom)
+2. First matching rule's action is taken
+3. Default action is **Accept** if no rules match
+4. Use `matchOperator: In` for CIDR containment matching
