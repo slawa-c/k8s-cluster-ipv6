@@ -489,6 +489,281 @@ calicoctl get bgppeer -o yaml
 calicoctl node status
 ```
 
+## External Access via Cloudflare Tunnels
+
+Cloudflare Tunnels provide secure external access to cluster services without exposing public IPs or opening firewall ports. The tunnel creates an outbound-only connection from the cluster to Cloudflare's edge network.
+
+**Benefits:**
+- No public IPv4/IPv6 addresses required
+- No firewall port forwarding needed
+- Automatic DDoS protection via Cloudflare
+- Free SSL/TLS certificates
+- Works with IPv6-only clusters
+
+### Prerequisites
+
+- Cloudflare account with a domain
+- `cloudflared` CLI tool installed on a management machine
+
+### Installation Steps
+
+#### 1. Install cloudflared CLI (on management machine or node)
+
+```bash
+# Add Cloudflare GPG key
+sudo mkdir -p --mode=0755 /etc/apt/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /etc/apt/keyrings/cloudflare-public-v2.gpg >/dev/null
+
+# Add repository
+echo 'deb [signed-by=/etc/apt/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+
+# Install cloudflared
+sudo apt-get update && sudo apt-get install cloudflared
+```
+
+#### 2. Authenticate with Cloudflare
+
+```bash
+cloudflared tunnel login
+# Opens browser to authenticate with Cloudflare account
+# Credentials saved to ~/.cloudflared/cert.pem
+```
+
+Output:
+```
+Please open the following URL and log in with your Cloudflare account:
+https://dash.cloudflare.com/argotunnel?aud=&callback=...
+
+You have successfully logged in.
+If you wish to copy your credentials to a server, they have been saved to:
+/root/.cloudflared/cert.pem
+```
+
+#### 3. Create Tunnel
+
+```bash
+cloudflared tunnel create k8s-lzadm-com-tunnel
+```
+
+Output:
+```
+Tunnel credentials written to /root/.cloudflared/b34831d9-1608-4ecc-b2cc-c0b13c7e195f.json
+Created tunnel k8s-lzadm-com-tunnel with id b34831d9-1608-4ecc-b2cc-c0b13c7e195f
+```
+
+**Important:** Keep the credentials file secure - it provides access to your tunnel.
+
+#### 4. Create Kubernetes Secret with Tunnel Credentials
+
+```bash
+kubectl create secret generic tunnel-credentials \
+  --from-file=credentials.json=/root/.cloudflared/b34831d9-1608-4ecc-b2cc-c0b13c7e195f.json
+```
+
+#### 5. Deploy cloudflared to Kubernetes
+
+Deploy as a DaemonSet to ensure tunnel availability across nodes:
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cloudflared
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+        - tunnel
+        # Force IPv6 for Cloudflare edge connections
+        - --edge-ip-version
+        - "6"
+        - --config
+        - /etc/cloudflared/config/config.yaml
+        - run
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 2000
+          failureThreshold: 1
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cloudflared/config
+          readOnly: true
+        - name: creds
+          mountPath: /etc/cloudflared/creds
+          readOnly: true
+      volumes:
+      - name: creds
+        secret:
+          secretName: tunnel-credentials
+      - name: config
+        configMap:
+          name: cloudflared
+          items:
+          - key: config.yaml
+            path: config.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared
+  namespace: default
+data:
+  config.yaml: |
+    tunnel: k8s-lzadm-com-tunnel
+    credentials-file: /etc/cloudflared/creds/credentials.json
+    metrics: 0.0.0.0:2000
+    no-autoupdate: true
+    ingress:
+    # Map external hostname to internal k8s service
+    - hostname: "whoami.slawa.uk"
+      service: http://whoami.default.svc.k8s.lzadm.com:80
+    # Catch-all rule (required as last entry)
+    - service: http_status:404
+EOF
+```
+
+**Configuration Notes:**
+- `--edge-ip-version: "6"` - Forces IPv6 for Cloudflare edge connections (works with IPv6-only cluster)
+- `tunnel: k8s-lzadm-com-tunnel` - Tunnel name created in step 3
+- `credentials-file` - Path to tunnel credentials in the secret
+- `ingress` - Maps external hostnames to internal k8s services
+- Last `ingress` entry must be a catch-all rule
+
+#### 6. Create DNS Route
+
+Map your domain to the tunnel:
+
+```bash
+cloudflared tunnel route dns k8s-lzadm-com-tunnel "whoami.slawa.uk"
+```
+
+This creates a CNAME record in Cloudflare DNS pointing to the tunnel.
+
+### Verification
+
+```bash
+# Check cloudflared pods
+kubectl get pods -l app=cloudflared -o wide
+
+# Check cloudflared logs
+kubectl logs -l app=cloudflared --tail=50
+
+# Check tunnel metrics
+kubectl run -it --rm curl --image=curlimages/curl --restart=Never -- \
+  curl http://cloudflared.default.svc.k8s.lzadm.com:2000/metrics
+
+# Test external access
+curl https://whoami.slawa.uk
+```
+
+### Adding More Services
+
+Edit the ConfigMap to add more ingress rules:
+
+```bash
+kubectl edit configmap cloudflared
+```
+
+Add new entries before the catch-all rule:
+
+```yaml
+ingress:
+- hostname: "app1.slawa.uk"
+  service: http://app1.default.svc.k8s.lzadm.com:80
+- hostname: "app2.slawa.uk"
+  service: http://app2.default.svc.k8s.lzadm.com:443
+  originServerName: app2.slawa.uk
+- hostname: "whoami.slawa.uk"
+  service: http://whoami.default.svc.k8s.lzadm.com:80
+- service: http_status:404
+```
+
+Then create DNS routes:
+
+```bash
+cloudflared tunnel route dns k8s-lzadm-com-tunnel "app1.slawa.uk"
+cloudflared tunnel route dns k8s-lzadm-com-tunnel "app2.slawa.uk"
+```
+
+### Troubleshooting
+
+**Tunnel not connecting:**
+```bash
+# Check pod status
+kubectl describe pods -l app=cloudflared
+
+# Check logs for errors
+kubectl logs -l app=cloudflared
+
+# Common issues:
+# - Incorrect credentials: verify secret contains correct credentials.json
+# - Tunnel name mismatch: ensure config.yaml tunnel name matches created tunnel
+# - Network connectivity: verify IPv6 connectivity to Cloudflare edge
+```
+
+**DNS not resolving:**
+```bash
+# Verify DNS route exists
+cloudflared tunnel route dns list
+
+# Check Cloudflare DNS records
+# Login to Cloudflare dashboard → DNS → Records
+# Should see CNAME record pointing to tunnel
+```
+
+**Service not accessible:**
+```bash
+# Verify service exists and is accessible from pod
+kubectl run -it --rm curl --image=curlimages/curl --restart=Never -- \
+  curl http://whoami.default.svc.k8s.lzadm.com:80
+
+# Check ingress configuration in ConfigMap
+kubectl get configmap cloudflared -o yaml
+```
+
+### Security Considerations
+
+- **Credentials:** Tunnel credentials provide full access to the tunnel - protect the Kubernetes secret
+- **Ingress rules:** Only expose necessary services
+- **Cloudflare Access:** Consider using Cloudflare Access for authentication
+- **Rate limiting:** Configure Cloudflare rate limiting rules to prevent abuse
+
+### Alternative: Deployment vs DaemonSet
+
+For high availability without running on every node, use a Deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    # ... same template as DaemonSet
+```
+
+**DaemonSet vs Deployment:**
+- **DaemonSet:** Runs on all nodes, maximum availability, more resource usage
+- **Deployment:** Runs fixed replicas, lower resource usage, sufficient for most cases
+
 ## Key Script Behaviors
 
 ### k3s-server-config-set.sh
