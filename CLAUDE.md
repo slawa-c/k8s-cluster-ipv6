@@ -21,8 +21,9 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
                                   ├──▶ [Unifi UDR7]      79fa::/64
                                   └──▶ [pfSense]         79fb::/64
                                                            ├── 79fb:0000-ffcb:: → host/node network (RA)
-                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP)
-                                                           └── 79fb:ff00::/112 → k3s services (BGP)
+                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP, filtered)
+                                                           ├── 79fb:ff00::/112 → k3s services (BGP)
+                                                           └── 79fb:ff01::/112 → LoadBalancer IPs (BGP)
 ```
 
 **Subnet Allocation from /56:**
@@ -32,8 +33,9 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
 | 79fa::/64 | Unifi UDR7 | |
 | 79fb::/64 | pfSense | Single /64 delegation |
 | ├─ 79fb:0000-ffcb:: | pfSense LAN | Host/node network (RA advertised) |
-| ├─ 79fb:ffcc::/112 | k3s cluster-cidr | Pod network (BGP advertised) |
-| └─ 79fb:ff00::/112 | k3s service-cidr | Service network (BGP advertised) |
+| ├─ 79fb:ffcc::/112 | k3s cluster-cidr | Pod network (BGP, filtered by BGPFilter) |
+| ├─ 79fb:ff00::/112 | k3s service-cidr | ClusterIP services (BGP advertised) |
+| └─ 79fb:ff01::/112 | k3s LoadBalancer | LoadBalancer IPs (BGP advertised) |
 | 79fc-79ff | Available | Future use |
 
 ## Architecture
@@ -58,9 +60,10 @@ This setup uses a single /64 subnet from Fritzbox with /112 ranges for k8s:
 - pfSense receives single `/64` via DHCPv6-PD from Fritzbox
 - pfSense advertises the full `/64` via Router Advertisements for host network
 - Nodes receive SLAAC addresses from the lower portion of the /64
-- k3s uses `79fb:ffcc::/112` for pods (learned via BGP from Calico)
-- k3s uses `79fb:ff00::/112` for services (learned via BGP from Calico)
-- BGP advertises only the /112 subnets to avoid routing conflicts
+- k3s uses `79fb:ffcc::/112` for pods (learned via BGP from Calico, **filtered by BGPFilter**)
+- k3s uses `79fb:ff00::/112` for ClusterIP services (advertised via BGP)
+- k3s uses `79fb:ff01::/112` for LoadBalancer IPs (advertised via BGP)
+- **BGPFilter** controls which routes are advertised to pfSense (rejects pod CIDR)
 
 **Node network:**
 - Nodes use systemd-networkd for IPv6 SLAAC (Stateless Address Autoconfiguration)
@@ -408,7 +411,22 @@ subjects:
   namespace: calico-system
 EOF
 
-# 4. Add pfSense as BGP peer with password authentication
+# 4. Create BGPFilter to control route advertisements (optional but recommended)
+kubectl apply -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPFilter
+metadata:
+  name: pfsense-export-filter
+spec:
+  exportV6:
+    # Reject pod CIDR advertisements to pfSense (not needed on router)
+    - action: Reject
+      matchOperator: In
+      cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
+    # Default action is Accept - ClusterIP and LoadBalancer CIDRs pass through
+EOF
+
+# 5. Add pfSense as BGP peer with password authentication and filter
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPPeer
@@ -421,8 +439,17 @@ spec:
     secretKeyRef:
       name: bgp-secrets
       key: pfsense-password
+  # Apply filter to control route advertisements
+  filters:
+    - pfsense-export-filter
 EOF
 ```
+
+**BGPFilter Benefits:**
+- **Reduces routing table size** on pfSense by filtering unnecessary pod routes
+- **Accepts service CIDR** (ff00::/112) for ClusterIP services
+- **Accepts LoadBalancer IPs** (ff01::/112) for external service access
+- **Rejects pod CIDR** (ffcc::/112) as pod routes don't need to be on pfSense
 
 **Note:** BGP passwords must be 80 characters or fewer. See [Calico BGP security docs](https://docs.tigera.io/calico/latest/network-policy/comms/secure-bgp) for details.
 
@@ -454,6 +481,12 @@ nslookup metrics-server.kube-system.svc.k8s.lzadm.com <cluster-dns-ip>
 # Check Calico status
 kubectl get installation -o yaml
 kubectl get ippools
+
+# Verify BGP configuration and filters
+calicoctl get bgpconfig -o yaml
+calicoctl get bgpfilter -o yaml
+calicoctl get bgppeer -o yaml
+calicoctl node status
 ```
 
 ## Key Script Behaviors
@@ -501,10 +534,18 @@ kubectl get ippools
 
 **BGP routes not advertised:**
 - Verify BGP peer configuration on pfSense
-- Check Calico BGP configuration: `kubectl get bgpconfig -o yaml`
+- Check Calico BGP configuration: `calicoctl get bgpconfig -o yaml`
 - Ensure service CIDR is correctly configured in BGPConfiguration
-- Verify pfSense receives BGP routes for cluster CIDR subnet (79fd::/64)
+- Check BGP peer status: `calicoctl node status`
+- Verify pfSense receives expected BGP routes (service CIDR, LoadBalancer IPs)
 - Check pfSense FRR BGP config allows routes from k8s peer group
+
+**BGPFilter not working:**
+- Verify BGPFilter resource exists: `calicoctl get bgpfilter -o yaml`
+- Check BGPPeer has filter attached: `calicoctl get bgppeer pfsense -o yaml | grep -A2 filters`
+- Ensure filter rules are correctly configured (action, matchOperator, cidr)
+- On pfSense FRR shell, verify pod routes are NOT present: `show bgp ipv6 unicast`
+- Check Calico logs for BGP filter errors: `kubectl logs -n calico-system -l k8s-app=calico-node`
 
 **Cluster-CIDR overlap errors during k3s installation:**
 - Ensure cluster-cidr uses a different /64 than the node network

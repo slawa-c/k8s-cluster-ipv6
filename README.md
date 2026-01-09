@@ -16,8 +16,9 @@ The main idea is to deploy kubernetes cluster in my home lab in subnet where onl
                                   ├──▶ [Unifi UDR7]      79fa::/64
                                   └──▶ [pfSense]         79fb::/64
                                                            ├── 79fb:0000-ffcb:: → host/node network (RA)
-                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP)
-                                                           └── 79fb:ff00::/112 → k3s services (BGP)
+                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP, filtered)
+                                                           ├── 79fb:ff00::/112 → k3s services (BGP)
+                                                           └── 79fb:ff01::/112 → LoadBalancer IPs (BGP)
 ```
 
 **BGP AS Numbers:**
@@ -455,7 +456,7 @@ copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
 
 ### Calico BGP Configuration
 
-See [CLAUDE.md](CLAUDE.md) for detailed BGP configuration with password authentication.
+See [CLAUDE.md](CLAUDE.md) for detailed BGP configuration with password authentication and [LoadBalance.md](LoadBalance.md) for MetalLB + Calico integration.
 
 ```bash
 # Get the /48 prefix and 4th hextet
@@ -515,7 +516,22 @@ subjects:
   namespace: calico-system
 EOF
 
-# 4. Add pfSense as BGP peer with password authentication
+# 4. Create BGPFilter to control route advertisements (optional but recommended)
+kubectl apply -f - <<EOF
+apiVersion: projectcalico.org/v3
+kind: BGPFilter
+metadata:
+  name: pfsense-export-filter
+spec:
+  exportV6:
+    # Reject pod CIDR advertisements to pfSense (reduces routing table size)
+    - action: Reject
+      matchOperator: In
+      cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
+    # Default action is Accept - ClusterIP and LoadBalancer CIDRs pass through
+EOF
+
+# 5. Add pfSense as BGP peer with password authentication and filter
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPPeer
@@ -528,8 +544,16 @@ spec:
     secretKeyRef:
       name: bgp-secrets
       key: pfsense-password
+  # Apply filter to control route advertisements
+  filters:
+    - pfsense-export-filter
 EOF
 ```
+
+**BGPFilter Benefits:**
+- Reduces pfSense routing table size by filtering pod routes
+- Only advertises service CIDR (ff00::/112) and LoadBalancer IPs (ff01::/112)
+- Pod routes (ffcc::/112) handled internally by Calico
 
 ### coredns check
 
