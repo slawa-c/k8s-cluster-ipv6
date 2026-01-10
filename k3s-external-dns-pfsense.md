@@ -64,13 +64,11 @@ key "externaldns-key" {
 
 ### Step 1.2: Add Key to pfSense BIND
 
-1. Navigate to: **Services → BIND DNS Server → Settings**
+1. Navigate to: **Services → BIND DNS Server → Advanced Settings**
 
-2. Click: **Show Advanced Options** (bottom of page)
+2. Find: **Global Settings** section
 
-3. Find: **Custom Options** field
-
-4. Paste the entire key block:
+3. Paste the entire key block:
    ```
    key "externaldns-key" {
        algorithm hmac-sha256;
@@ -78,7 +76,7 @@ key "externaldns-key" {
    };
    ```
 
-5. Click: **Save**
+4. Click: **Save**
 
 ### Step 1.3: Configure Zone for Dynamic Updates
 
@@ -448,6 +446,75 @@ dig @2001:a61:1162:79fb:2e0:4cff:fe68:9ff -p 5353 whoami.k8s.lzadm.com AAAA
 dig @2001:a61:1162:79fb:2e0:4cff:fe68:9ff -p 5353 externaldns-aaaa-whoami.k8s.lzadm.com TXT
 ```
 
+### Rotating/Updating TSIG Secret
+
+If you need to regenerate the TSIG key for security reasons or because it was compromised:
+
+**Step 1: Generate New TSIG Key on pfSense**
+
+```bash
+# SSH to pfSense
+tsig-keygen -a hmac-sha256 externaldns-key
+```
+
+Output:
+```
+key "externaldns-key" {
+    algorithm hmac-sha256;
+    secret "NEW_SECRET_HERE_BASE64";
+};
+```
+
+**Step 2: Update BIND Configuration**
+
+Update the key in pfSense BIND:
+
+1. Navigate to: **Services → BIND DNS Server → Advanced Settings**
+2. Find: **Global Settings** section
+3. Update the key block:
+   ```
+   key "externaldns-key" {
+       algorithm hmac-sha256;
+       secret "NEW_SECRET_HERE_BASE64";
+   };
+   ```
+4. Click: **Save**
+
+**Step 3: Update Kubernetes Secret**
+
+```bash
+# Update the secret with new TSIG value
+kubectl patch secret external-dns-rfc2136 -n external-dns \
+  -p '{"stringData":{"tsig-secret":"NEW_SECRET_HERE_BASE64"}}'
+
+# Restart ExternalDNS to pick up the new secret
+kubectl rollout restart deployment/external-dns -n external-dns
+
+# Verify the new secret is working
+kubectl logs -n external-dns -l app=external-dns --tail=20
+```
+
+**Expected output:**
+```
+level=info msg="Configured RFC2136 with zone '[k8s.lzadm.com]' and nameserver '[...]:5353'"
+level=info msg="All records are already up to date"
+```
+
+**Alternative: Delete and recreate the secret**
+
+```bash
+# Delete old secret
+kubectl delete secret external-dns-rfc2136 -n external-dns
+
+# Create new secret
+kubectl create secret generic external-dns-rfc2136 \
+  --from-literal=tsig-secret='NEW_SECRET_HERE_BASE64' \
+  --namespace=external-dns
+
+# Restart ExternalDNS
+kubectl rollout restart deployment/external-dns -n external-dns
+```
+
 ---
 
 ## Part 5: Configuration Reference
@@ -487,9 +554,11 @@ dig @2001:a61:1162:79fb:2e0:4cff:fe68:9ff -p 5353 externaldns-aaaa-whoami.k8s.lz
 
 - **Protect the TSIG secret** - it provides write access to your DNS zone
 - **Use strong keys** - hmac-sha256 with 256-bit keys is recommended
+- **Rotate secrets regularly** - regenerate TSIG keys periodically (see [Rotating TSIG Secret](#rotatingupdating-tsig-secret))
 - **Limit scope** - `zonesub` allows updates to all records; consider more restrictive policies
 - **Monitor updates** - check BIND logs for unauthorized update attempts
 - **Use `--policy=sync`** - ensures stale records are cleaned up when services are deleted
+- **Restrict namespace** - ExternalDNS only needs access to service/ingress resources, not cluster-admin
 
 ---
 

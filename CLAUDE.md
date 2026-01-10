@@ -889,6 +889,26 @@ kubectl run -it --rm debug --image=busybox --restart=Never -- \
   nslookup pfsense.home.lzadm.com
 ```
 
+### Rotating TSIG Secret
+
+To regenerate the TSIG key for security rotation:
+
+```bash
+# 1. Generate new key on pfSense
+tsig-keygen -a hmac-sha256 externaldns-key
+
+# 2. Update BIND configuration on pfSense
+
+# 3. Update Kubernetes secret
+kubectl patch secret external-dns-rfc2136 -n external-dns \
+  -p '{"stringData":{"tsig-secret":"NEW_SECRET_HERE"}}'
+
+# 4. Restart ExternalDNS
+kubectl rollout restart deployment/external-dns -n external-dns
+```
+
+See [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md#rotatingupdating-tsig-secret) for detailed steps.
+
 ## Key Script Behaviors
 
 ### k3s-server-config-set.sh

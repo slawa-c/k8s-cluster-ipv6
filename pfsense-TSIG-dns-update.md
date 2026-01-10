@@ -30,13 +30,11 @@ key "externaldns-key" {
 
 ## Step 2: Add Key to pfSense BIND
 
-1. Navigate to: **Services → BIND DNS Server → Settings**
+1. Navigate to: **Services → BIND DNS Server → Advanced Settings**
 
-2. Click: **Show Advanced Options** (bottom of page)
+2. Find: **Global Settings** section
 
-3. Find: **Custom Options** field
-
-4. Paste the entire key block:
+3. Paste the entire key block:
    ```
    key "externaldns-key" {
        algorithm hmac-sha256;
@@ -44,7 +42,7 @@ key "externaldns-key" {
    };
    ```
 
-5. Click: **Save**
+4. Click: **Save**
 
 ## Step 3: Configure Zone for Dynamic Updates
 
@@ -195,6 +193,39 @@ update add test.k8s.lzadm.com 300 AAAA 2001:a61:1162:79fb:ff01::1
 send
 EOF
 ```
+
+## Rotating TSIG Secret
+
+If you need to regenerate the TSIG key (for security rotation or compromise):
+
+### Quick Command Sequence
+
+```bash
+# 1. Generate new TSIG key on pfSense
+tsig-keygen -a hmac-sha256 externaldns-key
+# Copy the new secret value
+
+# 2. Update pfSense BIND (Services → BIND DNS Server → Advanced Settings → Global Settings)
+# Replace the key block with new secret and click Save
+
+# 3. Update Kubernetes secret
+kubectl patch secret external-dns-rfc2136 -n external-dns \
+  -p '{"stringData":{"tsig-secret":"NEW_SECRET_HERE"}}'
+
+# 4. Restart ExternalDNS
+kubectl rollout restart deployment/external-dns -n external-dns
+
+# 5. Verify
+kubectl logs -n external-dns -l app=external-dns --tail=10
+```
+
+**Expected verification output:**
+```
+level=info msg="Configured RFC2136 with zone '[k8s.lzadm.com]'"
+level=info msg="All records are already up to date"
+```
+
+See [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md#rotatingupdating-tsig-secret) for detailed steps.
 
 ## Security Considerations
 
