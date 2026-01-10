@@ -426,7 +426,7 @@ spec:
       - blockSize: 120
         cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
         encapsulation: None
-        natOutgoing: Disabled
+        natOutgoing: Enabled
         nodeSelector: all()
     nodeAddressAutodetectionV6:
       kubernetes: NodeInternalIP
@@ -554,6 +554,36 @@ EOF
 - Reduces pfSense routing table size by filtering pod routes
 - Only advertises service CIDR (ff00::/112) and LoadBalancer IPs (ff01::/112)
 - Pod routes (ffcc::/112) handled internally by Calico
+
+### DNS Management with ExternalDNS
+
+ExternalDNS automatically creates DNS records in pfSense BIND for LoadBalancer services, enabling home network devices to resolve cluster service names.
+
+**Quick Setup:**
+
+```bash
+# 1. Generate TSIG key on pfSense
+tsig-keygen -a hmac-sha256 externaldns-key
+
+# 2. Configure BIND zone for dynamic updates
+# See k3s-external-dns-pfsense.md for detailed instructions
+
+# 3. Deploy ExternalDNS
+kubectl apply -f external-dns-rfc2136.yaml
+
+# 4. Add annotation to LoadBalancer services
+kubectl annotate svc myapp external-dns.alpha.kubernetes.io/hostname=myapp.k8s.lzadm.com
+```
+
+**DNS Architecture:**
+- **CoreDNS** (internal): Authoritative for cluster services (*.svc.k8s.lzadm.com)
+- **BIND** (external): LoadBalancer service records managed by ExternalDNS
+- Pods query CoreDNS → ClusterIP (internal, fast)
+- Home network queries BIND → LoadBalancer IP (external access)
+
+**Documentation:**
+- Complete setup guide: [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md)
+- DNS architecture and best practices: [CLAUDE.md](CLAUDE.md#dns-management-with-externaldns)
 
 ### coredns check
 

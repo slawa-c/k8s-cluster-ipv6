@@ -8,9 +8,12 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
 
 **Key Infrastructure:**
 - **Network:** IPv6-only (2001:a61:1162:79fb::/64 single subnet with /112 ranges for k8s)
-- **Router:** pfSense with DNS64/NAT64, FRR BGP (AS 65101)
+- **Router:** pfSense with DNS64/NAT64, FRR BGP (AS 65101), BIND9 on port 5353
 - **Cluster:** k3s multi-node with Calico CNI, BGP peering (AS 65010)
-- **DNS:** Cluster domain `k8s.lzadm.com`, home domain `home.lzadm.com`
+- **DNS:**
+  - Cluster domain: `k8s.lzadm.com` (CoreDNS authoritative for cluster services)
+  - Home domain: `home.lzadm.com` (BIND on pfSense)
+  - ExternalDNS manages LoadBalancer records in BIND via RFC2136
 
 **Network Topology:**
 ```
@@ -764,6 +767,128 @@ spec:
 - **DaemonSet:** Runs on all nodes, maximum availability, more resource usage
 - **Deployment:** Runs fixed replicas, lower resource usage, sufficient for most cases
 
+## DNS Management with ExternalDNS
+
+ExternalDNS automatically manages DNS records in pfSense BIND for Kubernetes LoadBalancer services, enabling home network devices to resolve cluster service names.
+
+### DNS Architecture
+
+**CoreDNS vs BIND separation:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  DNS Authority Split                                             │
+├─────────────────────────────────────────────────────────────────┤
+│  Zone: k8s.lzadm.com                                            │
+│  ├── CoreDNS (internal): ClusterIPs                             │
+│  │   - *.svc.k8s.lzadm.com → service discovery                  │
+│  │   - *.pod.k8s.lzadm.com → pod IPs                            │
+│  │   - Forwards non-cluster queries to pfSense BIND             │
+│  │                                                              │
+│  └── BIND (external): LoadBalancer IPs only                     │
+│      - whoami.k8s.lzadm.com → LB IP (managed by ExternalDNS)    │
+│      - app.k8s.lzadm.com → LB IP                                │
+│      - (NOT all cluster services - only exposed)                │
+├─────────────────────────────────────────────────────────────────┤
+│  Zone: home.lzadm.com                                           │
+│  └── BIND only (pfSense)                                        │
+│      - k8s-node01.home → node IPs (via nsupdate script)         │
+│      - pfsense.home → router IP                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key principles:**
+- **CoreDNS** is authoritative for cluster domain (`k8s.lzadm.com`) inside the cluster
+- **BIND** on pfSense handles external queries and LoadBalancer service records
+- **ExternalDNS** automatically syncs LoadBalancer services to BIND via RFC2136
+- Pod queries for cluster services resolve internally (fast, no external lookup)
+- Home network queries for exposed services resolve via BIND
+
+### ExternalDNS Setup
+
+ExternalDNS uses RFC2136 (Dynamic DNS Updates) with TSIG authentication to manage records in pfSense BIND.
+
+**Prerequisites:**
+- pfSense BIND running on port 5353
+- TSIG key configured in BIND
+- `k8s.lzadm.com` zone allowing dynamic updates
+
+**Installation:**
+
+See [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md) for complete setup guide.
+
+Quick setup:
+
+```bash
+# 1. Generate TSIG key on pfSense
+tsig-keygen -a hmac-sha256 externaldns-key
+
+# 2. Configure BIND zone for dynamic updates (see k3s-external-dns-pfsense.md)
+
+# 3. Deploy ExternalDNS
+kubectl apply -f external-dns-rfc2136.yaml
+```
+
+**Usage:**
+
+Add annotation to any LoadBalancer service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: myapp.k8s.lzadm.com
+spec:
+  type: LoadBalancer
+  selector:
+    app: myapp
+  ports:
+    - port: 80
+```
+
+ExternalDNS will automatically:
+1. Detect the service and its LoadBalancer IP
+2. Create DNS record in pfSense BIND: `myapp.k8s.lzadm.com → 2001:a61:1162:79fb:ff01::X`
+3. Create TXT ownership record for tracking
+4. Update/delete records when service changes or is removed
+
+**Verify:**
+
+```bash
+# Check ExternalDNS logs
+kubectl logs -n external-dns -l app=external-dns
+
+# Query DNS record
+dig @2001:a61:1162:79fb:2e0:4cff:fe68:9ff -p 5353 myapp.k8s.lzadm.com AAAA +short
+
+# From home network
+dig myapp.k8s.lzadm.com AAAA +short
+```
+
+### CoreDNS Configuration
+
+CoreDNS is configured to:
+- Be authoritative for `k8s.lzadm.com`
+- Forward non-cluster queries to pfSense BIND
+- Maintain node hostname mappings
+
+**Verify CoreDNS:**
+
+```bash
+# Check CoreDNS config
+kubectl get configmap coredns -n kube-system -o yaml
+
+# Test cluster service resolution
+kubectl run -it --rm debug --image=busybox --restart=Never -- \
+  nslookup kubernetes.default.svc.k8s.lzadm.com
+
+# Test external DNS resolution (via BIND)
+kubectl run -it --rm debug --image=busybox --restart=Never -- \
+  nslookup pfsense.home.lzadm.com
+```
+
 ## Key Script Behaviors
 
 ### k3s-server-config-set.sh
@@ -826,3 +951,17 @@ spec:
 - Ensure cluster-cidr uses a different /64 than the node network
 - Verify `k3s-server-config-set.sh` generates `79fd` for cluster-cidr (not `79fc`)
 - Do not reuse the same /64 that pfSense advertises via RA for host addresses
+
+**ExternalDNS not creating records:**
+- Check ExternalDNS logs: `kubectl logs -n external-dns -l app=external-dns`
+- Verify service has LoadBalancer IP assigned: `kubectl get svc`
+- Check service has hostname annotation: `external-dns.alpha.kubernetes.io/hostname`
+- Verify TSIG authentication: test with `nsupdate` manually
+- Check BIND allows updates: review `/var/log/resolver.log` on pfSense
+- Ensure ExternalDNS can reach BIND on port 5353
+
+**DNS records not resolving from home network:**
+- Query BIND directly: `dig @pfsense-ip -p 5353 hostname.k8s.lzadm.com AAAA`
+- Check home DNS server forwards to pfSense BIND
+- Verify LoadBalancer IP is reachable from home network
+- Check BGP advertised LoadBalancer CIDR to pfSense

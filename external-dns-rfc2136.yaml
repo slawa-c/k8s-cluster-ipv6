@@ -1,0 +1,221 @@
+# ExternalDNS for BIND on pfSense using RFC2136 (Dynamic DNS Updates)
+#
+# Prerequisites:
+# 1. Generate TSIG key on pfSense (see instructions below)
+# 2. Configure BIND zone for dynamic updates
+# 3. Update the TSIG secret in the Secret resource below
+#
+# =============================================================================
+# STEP 1: Generate TSIG Key on pfSense
+# =============================================================================
+# SSH to pfSense and run:
+#
+#   tsig-keygen -a hmac-sha256 externaldns-key
+#
+# Output will look like:
+#   key "externaldns-key" {
+#       algorithm hmac-sha256;
+#       secret "YOUR_BASE64_SECRET_HERE";
+#   };
+#
+# Copy the secret value and update the Secret below.
+#
+# =============================================================================
+# STEP 2: Configure BIND Zone on pfSense
+# =============================================================================
+# In pfSense BIND configuration, ensure k8s.lzadm.com zone has:
+#
+# Option A: Using pfSense BIND GUI:
+#   - Go to Services > BIND DNS Server > Zones
+#   - Edit k8s.lzadm.com zone
+#   - Enable "Allow Update" and add the TSIG key
+#
+# Option B: Manual named.conf (if editing directly):
+#
+#   key "externaldns-key" {
+#       algorithm hmac-sha256;
+#       secret "YOUR_BASE64_SECRET_HERE";
+#   };
+#
+#   zone "k8s.lzadm.com" {
+#       type master;
+#       file "/var/named/etc/namedb/master/k8s.lzadm.com.db";
+#       allow-transfer { key "externaldns-key"; };
+#       update-policy {
+#           grant externaldns-key zonesub ANY;
+#       };
+#   };
+#
+# =============================================================================
+# STEP 3: Apply this manifest
+# =============================================================================
+#   kubectl apply -f external-dns-rfc2136.yaml
+#
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-dns
+
+---
+# TSIG Secret for RFC2136 authentication
+# IMPORTANT: Replace YOUR_BASE64_SECRET_HERE with the actual TSIG secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: external-dns-rfc2136
+  namespace: external-dns
+type: Opaque
+stringData:
+  # Replace this with the secret from: tsig-keygen -a hmac-sha256 externaldns-key
+  tsig-secret: "YOUR_BASE64_SECRET_HERE"
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns
+  namespace: external-dns
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "nodes"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "watch", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+  - kind: ServiceAccount
+    name: external-dns
+    namespace: external-dns
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: external-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: external-dns
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: external-dns
+    spec:
+      serviceAccountName: external-dns
+      containers:
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.15.0
+          args:
+            # Provider configuration
+            - --provider=rfc2136
+
+            # pfSense BIND server (IPv6 address)
+            # Update this to match your pfSense IPv6 address
+            - --rfc2136-host=2001:a61:1162:79fb:2e0:4cff:fe68:9ff
+
+            # pfSense BIND runs on port 5353 (non-standard)
+            - --rfc2136-port=5353
+
+            # Zone to manage
+            - --rfc2136-zone=k8s.lzadm.com
+
+            # TSIG authentication
+            - --rfc2136-tsig-keyname=externaldns-key
+            - --rfc2136-tsig-secret=$(TSIG_SECRET)
+            - --rfc2136-tsig-secret-alg=hmac-sha256
+
+            # Enable zone transfer for proper record management
+            - --rfc2136-tsig-axfr
+
+            # Default TTL for records (must include time unit)
+            - --rfc2136-min-ttl=300s
+
+            # Sources to watch
+            - --source=service
+            - --source=ingress
+
+            # Only manage records in k8s.lzadm.com domain
+            - --domain-filter=k8s.lzadm.com
+
+            # Registry for tracking ownership (prevents conflicts)
+            - --registry=txt
+            - --txt-owner-id=k8s-cluster
+            - --txt-prefix=externaldns-
+
+            # Policy: sync will delete records when services are removed
+            # Use 'upsert-only' if you don't want automatic deletion
+            - --policy=sync
+
+            # Logging
+            - --log-level=info
+            - --log-format=text
+
+            # Update interval
+            - --interval=1m
+          env:
+            - name: TSIG_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-rfc2136
+                  key: tsig-secret
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+# Example: Test service with ExternalDNS annotation
+# Uncomment to test after deployment
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: whoami-external
+#   namespace: default
+#   annotations:
+#     # This tells ExternalDNS to create a DNS record
+#     external-dns.alpha.kubernetes.io/hostname: whoami.k8s.lzadm.com
+#     # Optional: custom TTL
+#     external-dns.alpha.kubernetes.io/ttl: "300"
+# spec:
+#   type: LoadBalancer
+#   selector:
+#     app: whoami
+#   ports:
+#     - port: 80
+#       targetPort: 80
