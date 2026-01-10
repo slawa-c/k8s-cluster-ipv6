@@ -567,6 +567,105 @@ Name:	metrics-server.kube-system.svc.k8s.lzadm.com
 Address: 2001:a61:1162:79fb:ff00::xxxx
 ```
 
+## External Access via Cloudflare Tunnels
+
+Cloudflare Tunnels provide secure external access without public IPs or firewall configuration. Perfect for IPv6-only clusters.
+
+See [CLAUDE.md](CLAUDE.md) for comprehensive documentation.
+
+### Quick Setup
+
+```bash
+# 1. Install cloudflared CLI
+sudo mkdir -p --mode=0755 /etc/apt/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg | sudo tee /etc/apt/keyrings/cloudflare-public-v2.gpg >/dev/null
+echo 'deb [signed-by=/etc/apt/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
+
+# 2. Authenticate and create tunnel
+cloudflared tunnel login
+cloudflared tunnel create k8s-lzadm-com-tunnel
+
+# 3. Create Kubernetes secret
+kubectl create secret generic tunnel-credentials \
+  --from-file=credentials.json=/root/.cloudflared/<tunnel-id>.json
+
+# 4. Deploy cloudflared to cluster
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cloudflared
+spec:
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+        - tunnel
+        - --edge-ip-version
+        - "6"
+        - --config
+        - /etc/cloudflared/config/config.yaml
+        - run
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 2000
+          failureThreshold: 1
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cloudflared/config
+          readOnly: true
+        - name: creds
+          mountPath: /etc/cloudflared/creds
+          readOnly: true
+      volumes:
+      - name: creds
+        secret:
+          secretName: tunnel-credentials
+      - name: config
+        configMap:
+          name: cloudflared
+          items:
+          - key: config.yaml
+            path: config.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared
+data:
+  config.yaml: |
+    tunnel: k8s-lzadm-com-tunnel
+    credentials-file: /etc/cloudflared/creds/credentials.json
+    metrics: 0.0.0.0:2000
+    no-autoupdate: true
+    ingress:
+    - hostname: "whoami.slawa.uk"
+      service: http://whoami.default.svc.k8s.lzadm.com:80
+    - service: http_status:404
+EOF
+
+# 5. Create DNS route
+cloudflared tunnel route dns k8s-lzadm-com-tunnel "whoami.slawa.uk"
+```
+
+**Key Features:**
+- IPv6 support via `--edge-ip-version: "6"`
+- No public IP or firewall changes needed
+- Free SSL/TLS certificates
+- DDoS protection via Cloudflare
+
 ### uninstall k3s
 
 ```bash
