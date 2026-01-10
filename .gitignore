@@ -9,4 +9,4 @@
 **.env
 **/node_modules
 pfsense-BGP.conf
-
+**/.cloudflared
