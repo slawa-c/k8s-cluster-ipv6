@@ -446,9 +446,50 @@ EOF
 cat /etc/rancher/k3s/k3s.yaml
 ```
 
-### copy content of k3s.yaml
+### Kubernetes API LoadBalancer (Recommended)
 
-copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
+For reliable cluster management with automatic failover, expose the API via LoadBalancer:
+
+```bash
+# Convert kubernetes service to LoadBalancer
+kubectl patch svc kubernetes -p '{"spec":{"type":"LoadBalancer","loadBalancerIP":"2001:a61:1162:79fb:ff01::1"}}'
+kubectl annotate svc kubernetes external-dns.alpha.kubernetes.io/hostname=api.k8s.lzadm.com
+
+# Update kubeconfig
+kubectl config set-cluster default --server=https://api.k8s.lzadm.com:443
+```
+
+**Important:** Add auto-apply manifest on each server node to persist after restarts:
+```bash
+# On each k3s server node (k8s-node01, k8s-node02, k8s-node03)
+sudo tee /var/lib/rancher/k3s/server/manifests/kubernetes-api-loadbalancer.yaml > /dev/null <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes
+  namespace: default
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: api.k8s.lzadm.com
+  labels:
+    component: apiserver
+    provider: kubernetes
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 2001:a61:1162:79fb:ff01::1
+  ports:
+  - name: https
+    port: 443
+    protocol: TCP
+    targetPort: 6443
+  sessionAffinity: None
+EOF
+```
+
+**Documentation:** See [k3s-api-loadbalancer.md](k3s-api-loadbalancer.md) for complete setup, TLS configuration, and troubleshooting.
+
+### Alternative: Direct Node Access
+
+Copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
 
 ```bash
      server: https://k8s-node01:6443

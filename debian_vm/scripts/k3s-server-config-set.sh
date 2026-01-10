@@ -72,6 +72,8 @@ kube-controller-manager-arg:
 tls-san:
   - "ctrl.$DOMAIN"
   - "k3s-cluster.$DOMAIN"
+  - "api.$DOMAIN"
+  - "${IPV6PREFIX_48}:${IPV6_4TH_HEXTET}:ff01::1"
 disable:
   - traefik
 EOL

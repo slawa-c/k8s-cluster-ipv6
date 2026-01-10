@@ -464,7 +464,25 @@ EOF
 
 ### Cluster Access
 
-**Get kubeconfig from server node:**
+**Recommended: Use API LoadBalancer for HA access**
+
+For reliable, resilient cluster management, use a LoadBalancer service for the Kubernetes API. This provides automatic failover between server nodes.
+
+See [k3s-api-loadbalancer.md](k3s-api-loadbalancer.md) for complete setup guide.
+
+**Quick setup:**
+```bash
+# Convert kubernetes service to LoadBalancer
+kubectl patch svc kubernetes -p '{"spec":{"type":"LoadBalancer","loadBalancerIP":"2001:a61:1162:79fb:ff01::1"}}'
+kubectl annotate svc kubernetes external-dns.alpha.kubernetes.io/hostname=api.k8s.lzadm.com
+
+# Update kubeconfig to use LoadBalancer
+kubectl config set-cluster default --server=https://api.k8s.lzadm.com:443
+```
+
+**Alternative: Direct node access**
+
+Get kubeconfig from server node:
 ```bash
 # On server node
 cat /etc/rancher/k3s/k3s.yaml
@@ -985,3 +1003,14 @@ See [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md#rotatingupdating-t
 - Check home DNS server forwards to pfSense BIND
 - Verify LoadBalancer IP is reachable from home network
 - Check BGP advertised LoadBalancer CIDR to pfSense
+
+**Kubernetes service reverts to ClusterIP after k3s restart:**
+- k3s recreates the default `kubernetes` service as ClusterIP on startup
+- Manual patches are lost after restart
+- **Solution:** Use k3s auto-apply manifests in `/var/lib/rancher/k3s/server/manifests/`
+- See [k3s-api-loadbalancer.md](k3s-api-loadbalancer.md#permanent-solution-auto-apply-manifest) for detailed fix
+
+**LoadBalancer IP not assigned to kubernetes service:**
+- Check if auto-apply manifest exists: `/var/lib/rancher/k3s/server/manifests/kubernetes-api-loadbalancer.yaml`
+- Verify MetalLB pool has IPs available: `kubectl get ipaddresspool -n metallb-system`
+- Check MetalLB controller logs: `kubectl logs -n metallb-system -l component=controller`
