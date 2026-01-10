@@ -8,5 +8,5 @@
 **.AGENT.md
 **.env
 **/node_modules
-pfsense-BGP.conf
+**.conf
 **/.cloudflared
