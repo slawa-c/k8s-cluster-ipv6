@@ -8,18 +8,16 @@ if [ -z "$INTERFACE" ]; then
     exit 1
 fi
 
-# --- Get the stable global IPv6 address (non-temporary, scope global) ---
-# On Linux, temporary/privacy addresses have the "temporary" flag or are marked deprecated
+# --- Get the ULA IPv6 address (stable across ISP prefix changes) ---
+# ULA addresses (fd00::/8 and fc00::/8 per RFC 4193) remain stable when ISP prefix changes
 IP=$(ip -6 addr show dev "$INTERFACE" scope global \
      | awk '/inet6/ {print $2}' \
      | cut -d/ -f1 \
-     | grep -v '^fd' \
-     | grep -v '^fe80' \
-     | grep -v 'temporary' \
+     | grep -E '^fd|^fc' \
      | head -1)
 
 if [ -z "$IP" ]; then
-    echo "Error: No stable global IPv6 address found on $INTERFACE"
+    echo "Error: No ULA IPv6 address found on $INTERFACE"
     exit 1
 fi
 
