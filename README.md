@@ -8,18 +8,43 @@ The main idea is to deploy kubernetes cluster in my home lab in subnet where onl
 
 ## Network Topology
 
+The cluster uses a **ULA + GUA hybrid architecture** for ISP prefix change resilience:
+- **ULA (Unique Local Addresses)**: Used for internal cluster networking (stable, never changes)
+- **GUA (Global Unicast Addresses)**: Used only for LoadBalancer IPs (changes with ISP prefix)
+
 ```
-[ISP DSLite /56: 2001:a61:1162::/56]
+[ISP DSLite /56: 2001:a61:XXXX::/56]  ← Changes with ISP prefix delegation
               │
               ▼
-        [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  79e0::/60 (79e0-79ef)
-                                  ├──▶ [Unifi UDR7]      79fa::/64
-                                  └──▶ [pfSense]         79fb::/64
-                                                           ├── 79fb:0000-ffcb:: → host/node network (RA)
-                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP, filtered)
-                                                           ├── 79fb:ff00::/112 → k3s services (BGP)
-                                                           └── 79fb:ff01::/112 → LoadBalancer IPs (BGP)
+        [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  GUA /60
+                                  ├──▶ [Unifi UDR7]      GUA /64
+                                  └──▶ [pfSense]         GUA /64
+                                           │
+                                           ├── GUA /64 → host network (RA)
+                                           └── ULA fd77:3be9:5d2e:1::/64 → k8s nodes (RA)
+                                                  │
+                                        ┌─────────┴─────────┐
+                                        │    k3s Cluster    │
+                                        │                   │
+                                        │  ULA (stable):    │
+                                        │  ├─ nodes         │
+                                        │  ├─ pods          │
+                                        │  ├─ ClusterIPs    │
+                                        │  └─ BGP peers     │
+                                        │                   │
+                                        │  GUA (dynamic):   │
+                                        │  └─ LoadBalancer  │
+                                        │     IPs only      │
+                                        └───────────────────┘
 ```
+
+**Address Allocation:**
+| Type | Prefix | Stability | Usage |
+|------|--------|-----------|-------|
+| ULA | `fd77:3be9:5d2e:1::/64` | Permanent | Node network |
+| ULA | `fd77:3be9:5d2e:ffcc::/112` | Permanent | Pod network |
+| ULA | `fd77:3be9:5d2e:ff00::/112` | Permanent | ClusterIP services |
+| GUA | `<ISP-prefix>:ff01::/112` | Changes with ISP | LoadBalancer IPs |
 
 **BGP AS Numbers:**
 | Device | AS Number |
@@ -152,18 +177,16 @@ if [ -z "$INTERFACE" ]; then
     exit 1
 fi
 
-# --- Get the stable global IPv6 address (non-temporary, scope global) ---
-# On Linux, temporary/privacy addresses have the "temporary" flag or are marked deprecated
+# --- Get the ULA IPv6 address (stable across ISP prefix changes) ---
+# ULA addresses (fd00::/8 and fc00::/8 per RFC 4193) remain stable when ISP prefix changes
 IP=$(ip -6 addr show dev "$INTERFACE" scope global \
      | awk '/inet6/ {print $2}' \
      | cut -d/ -f1 \
-     | grep -v '^fd' \
-     | grep -v '^fe80' \
-     | grep -v 'temporary' \
+     | grep -E '^fd|^fc' \
      | head -1)
 
 if [ -z "$IP" ]; then
-    echo "Error: No stable global IPv6 address found on $INTERFACE"
+    echo "Error: No ULA IPv6 address found on $INTERFACE"
     exit 1
 fi
 
@@ -354,10 +377,11 @@ echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 
 #### k3s-server-config-set.sh
 
-The script is located at `debian_vm/scripts/k3s-server-config-set.sh`. It automatically:
-- Detects the node's IPv6 address and extracts the /48 prefix and 4th hextet
-- Configures cluster-cidr using /112 within the host /64 (79fb:ffcc::/112)
-- Sets up service CIDR and cluster DNS in separate /112 ranges
+The script is located at `debian_vm/scripts/k3s-server-config-set.sh`. It uses **fixed ULA prefix** (`fd77:3be9:5d2e`) for all internal cluster networking, making the cluster immune to ISP prefix changes.
+
+The script automatically:
+- Detects the node's ULA address from SLAAC
+- Configures cluster-cidr, service-cidr, and cluster-dns using ULA
 - Configures per-node allocation of /120 (256 pod IPs per node)
 
 ```bash
@@ -366,9 +390,10 @@ The script is located at `debian_vm/scripts/k3s-server-config-set.sh`. It automa
 ```
 
 The script generates `/etc/rancher/k3s/config.yaml` with:
-- `cluster-cidr: <prefix>:<4th-hextet>:ffcc::/112`
-- `service-cidr: <prefix>:<4th-hextet>:ff00::/112`
-- `cluster-dns: <prefix>:<4th-hextet>:ff00::10`
+- `node-ip: fd77:3be9:5d2e:1::<node-suffix>` (ULA, stable)
+- `cluster-cidr: fd77:3be9:5d2e:ffcc::/112` (ULA, stable)
+- `service-cidr: fd77:3be9:5d2e:ff00::/112` (ULA, stable)
+- `cluster-dns: fd77:3be9:5d2e:ff00::10` (ULA, stable)
 - `node-cidr-mask-size-ipv6: 120` (256 pod IPs per node, max 256 nodes)
 
 ### install k3s
@@ -409,12 +434,7 @@ kube-system   metrics-server-7b9c9c4b9c-ghmbf           0/1     ContainerCreatin
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/operator-crds.yaml
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/tigera-operator.yaml
 
-# Get the /48 prefix and 4th hextet from node IP
-NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
-PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
-HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
-
-# Configure Calico with IPv6 using /112 cluster-cidr with /120 per-node blocks
+# Configure Calico with ULA IPv6 pool (stable across ISP prefix changes)
 kubectl create -f - <<EOF
 apiVersion: operator.tigera.io/v1
 kind: Installation
@@ -424,12 +444,14 @@ spec:
   calicoNetwork:
     ipPools:
       - blockSize: 120
-        cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
+        cidr: fd77:3be9:5d2e:ffcc::/112
         encapsulation: None
-        natOutgoing: Enabled
+        natOutgoing: Disabled
         nodeSelector: all()
     nodeAddressAutodetectionV6:
-      kubernetes: NodeInternalIP
+      # Detect ULA addresses for node IPs
+      cidrs:
+        - "fd77:3be9:5d2e:1::/64"
 EOF
 
 # Create Calico API server
@@ -448,20 +470,26 @@ cat /etc/rancher/k3s/k3s.yaml
 
 ### Kubernetes API LoadBalancer (Recommended)
 
-For reliable cluster management with automatic failover, expose the API via LoadBalancer:
+For reliable cluster management with automatic failover, expose the API via LoadBalancer.
+
+**Note:** LoadBalancer IPs use GUA (changes with ISP prefix). Use DNS name `api.k8s.lzadm.com` which is auto-updated by ExternalDNS.
 
 ```bash
-# Convert kubernetes service to LoadBalancer
-kubectl patch svc kubernetes -p '{"spec":{"type":"LoadBalancer","loadBalancerIP":"2001:a61:1162:79fb:ff01::1"}}'
+# Get current GUA prefix for LoadBalancer IP
+GUA_PREFIX=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fc' | grep -v '^fe80' | head -1 | cut -d: -f1-4)
+
+# Convert kubernetes service to LoadBalancer with GUA IP
+kubectl patch svc kubernetes -p "{\"spec\":{\"type\":\"LoadBalancer\",\"loadBalancerIP\":\"${GUA_PREFIX}:ff01::1\"}}"
 kubectl annotate svc kubernetes external-dns.alpha.kubernetes.io/hostname=api.k8s.lzadm.com
 
-# Update kubeconfig
+# Update kubeconfig to use DNS name (resilient to prefix changes)
 kubectl config set-cluster default --server=https://api.k8s.lzadm.com:443
 ```
 
-**Important:** Add auto-apply manifest on each server node to persist after restarts:
+**Important:** Add auto-apply manifest on each server node to persist after restarts. Update the `loadBalancerIP` with your current GUA prefix:
 ```bash
 # On each k3s server node (k8s-node01, k8s-node02, k8s-node03)
+# Replace <GUA_PREFIX> with your current ISP prefix (e.g., 2001:a61:35b3:cdfa)
 sudo tee /var/lib/rancher/k3s/server/manifests/kubernetes-api-loadbalancer.yaml > /dev/null <<'EOF'
 apiVersion: v1
 kind: Service
@@ -475,7 +503,7 @@ metadata:
     provider: kubernetes
 spec:
   type: LoadBalancer
-  loadBalancerIP: 2001:a61:1162:79fb:ff01::1
+  loadBalancerIP: <GUA_PREFIX>:ff01::1
   ports:
   - name: https
     port: 443
@@ -497,15 +525,19 @@ Copy content k3s.yaml to ~/.kube/config for managing k3s cluster, replace
 
 ### Calico BGP Configuration
 
+BGP configuration uses ULA for peer addresses (stable) and advertises both ULA service CIDR and GUA LoadBalancer pool.
+
 See [CLAUDE.md](CLAUDE.md) for detailed BGP configuration with password authentication and [LoadBalance.md](LoadBalance.md) for MetalLB + Calico integration.
 
 ```bash
-# Get the /48 prefix and 4th hextet
-NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
-PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
-HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
+# Get current GUA prefix for LoadBalancer pool (changes with ISP)
+GUA_PREFIX=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fc' | grep -v '^fe80' | head -1 | cut -d: -f1-4)
 
-# 1. Configure Calico BGP with custom AS number (65010) and service advertisement
+echo "ULA prefix (stable):     fd77:3be9:5d2e"
+echo "GUA prefix (from ISP):   $GUA_PREFIX"
+echo "LoadBalancer pool:       ${GUA_PREFIX}:ff01::/112"
+
+# 1. Configure Calico BGP with ULA service CIDR and GUA LoadBalancer pool
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPConfiguration
@@ -514,7 +546,11 @@ metadata:
 spec:
   asNumber: 65010
   serviceClusterIPs:
-  - cidr: ${PREFIX_48}:${HEXTET_4}:ff00::/112
+    # ClusterIP services use ULA (stable)
+    - cidr: fd77:3be9:5d2e:ff00::/112
+  serviceLoadBalancerIPs:
+    # LoadBalancer IPs use GUA (update this when ISP prefix changes)
+    - cidr: ${GUA_PREFIX}:ff01::/112
 EOF
 
 # 2. Create secret for BGP password
@@ -557,7 +593,7 @@ subjects:
   namespace: calico-system
 EOF
 
-# 4. Create BGPFilter to control route advertisements (optional but recommended)
+# 4. Create BGPFilter to control route advertisements
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPFilter
@@ -565,27 +601,27 @@ metadata:
   name: pfsense-export-filter
 spec:
   exportV6:
-    # Reject pod CIDR advertisements to pfSense (reduces routing table size)
+    # Reject pod CIDR advertisements to pfSense (not needed on router)
     - action: Reject
       matchOperator: In
-      cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
-    # Default action is Accept - ClusterIP and LoadBalancer CIDRs pass through
+      cidr: fd77:3be9:5d2e:ffcc::/112
+    # Default action is Accept - ClusterIP (ULA) and LoadBalancer (GUA) pass through
 EOF
 
-# 5. Add pfSense as BGP peer with password authentication and filter
+# 5. Add pfSense as BGP peer using ULA address (stable across ISP changes)
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPPeer
 metadata:
   name: pfsense
 spec:
-  peerIP: <pfsense-ipv6-address>
+  # Use pfSense ULA address (stable, never changes)
+  peerIP: fd77:3be9:5d2e:1::1
   asNumber: 65101
   password:
     secretKeyRef:
       name: bgp-secrets
       key: pfsense-password
-  # Apply filter to control route advertisements
   filters:
     - pfsense-export-filter
 EOF
@@ -593,8 +629,9 @@ EOF
 
 **BGPFilter Benefits:**
 - Reduces pfSense routing table size by filtering pod routes
-- Only advertises service CIDR (ff00::/112) and LoadBalancer IPs (ff01::/112)
-- Pod routes (ffcc::/112) handled internally by Calico
+- Accepts service CIDR (ULA ff00::/112) for ClusterIP services
+- Accepts LoadBalancer IPs (GUA ff01::/112) for external access
+- Rejects pod CIDR (ULA ffcc::/112) as pod routes don't need to be on pfSense
 
 ### DNS Management with ExternalDNS
 
@@ -629,13 +666,13 @@ kubectl annotate svc myapp external-dns.alpha.kubernetes.io/hostname=myapp.k8s.l
 ### coredns check
 
 ```bash
-# Example with prefix 2001:a61:1162:79fb - cluster DNS is at :ff00::10
-nslookup metrics-server.kube-system.svc.k8s.lzadm.com 2001:a61:1162:79fb:ff00::10
-Server:		2001:a61:1162:79fb:ff00::10
-Address:	2001:a61:1162:79fb:ff00::10#53
+# Cluster DNS uses ULA address (stable across ISP prefix changes)
+nslookup metrics-server.kube-system.svc.k8s.lzadm.com fd77:3be9:5d2e:ff00::10
+Server:		fd77:3be9:5d2e:ff00::10
+Address:	fd77:3be9:5d2e:ff00::10#53
 
 Name:	metrics-server.kube-system.svc.k8s.lzadm.com
-Address: 2001:a61:1162:79fb:ff00::xxxx
+Address: fd77:3be9:5d2e:ff00::xxxx
 ```
 
 ## External Access via Cloudflare Tunnels
