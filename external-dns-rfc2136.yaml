@@ -70,7 +70,7 @@ metadata:
 type: Opaque
 stringData:
   # Replace this with the secret from: tsig-keygen -a hmac-sha256 externaldns-key
-  tsig-secret: "YOUR_BASE64_SECRET_HERE"
+  tsig-secret: "a/9QrtrlqFeoKaQkn4QEWAvE2xNlwKirVuVlNZrJ8D8="
 
 ---
 apiVersion: v1
@@ -135,9 +135,9 @@ spec:
             # Provider configuration
             - --provider=rfc2136
 
-            # pfSense BIND server (IPv6 address)
-            # Update this to match your pfSense IPv6 address
-            - --rfc2136-host=2001:a61:1162:79fb:2e0:4cff:fe68:9ff
+            # pfSense BIND server (ULA address for ISP prefix resilience)
+            # This ULA address never changes, even when ISP prefix changes
+            - --rfc2136-host=fd77:3be9:5d2e:1::1
 
             # pfSense BIND runs on port 5353 (non-standard)
             - --rfc2136-port=5353

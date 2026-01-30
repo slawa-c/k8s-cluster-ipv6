@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMware Fusion on macOS. The cluster uses DNS64/NAT64 on pfSense for IPv4 connectivity, Calico CNI for networking, and BGP peering with pfSense for service advertisement.
 
 **Key Infrastructure:**
-- **Network:** IPv6-only (2001:a61:1162:79fb::/64 single subnet with /112 ranges for k8s)
+- **Network:** Dual-stack ULA + GUA (ULA for internal stability, GUA for external LoadBalancers)
 - **Router:** pfSense with DNS64/NAT64, FRR BGP (AS 65101), BIND9 on port 5353
 - **Cluster:** k3s multi-node with Calico CNI, BGP peering (AS 65010)
 - **DNS:**
@@ -15,31 +15,48 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
   - Home domain: `home.lzadm.com` (BIND on pfSense)
   - ExternalDNS manages LoadBalancer records in BIND via RFC2136
 
+**ISP Prefix Resilience:**
+The cluster uses ULA (Unique Local Addresses) for internal networking, making it resilient to ISP IPv6 prefix changes. Only LoadBalancer IPs use GUA (Global Unicast Addresses) from the ISP.
+
 **Network Topology:**
 ```
-[ISP DSLite /56: 2001:a61:1162::/56]
+[ISP DSLite /56: 2001:a61:XXXX::/56]  ← Changes with ISP prefix delegation
               │
               ▼
-        [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  79e0::/60 (79e0-79ef)
-                                  ├──▶ [Unifi UDR7]      79fa::/64
-                                  └──▶ [pfSense]         79fb::/64
-                                                           ├── 79fb:0000-ffcb:: → host/node network (RA)
-                                                           ├── 79fb:ffcc::/112 → k3s pods (BGP, filtered)
-                                                           ├── 79fb:ff00::/112 → k3s services (BGP)
-                                                           └── 79fb:ff01::/112 → LoadBalancer IPs (BGP)
+        [Fritzbox] ── DHCPv6-PD ──┬──▶ [Mikrotik hex-s]  GUA /60
+                                  ├──▶ [Unifi UDR7]      GUA /64
+                                  └──▶ [pfSense]         GUA /64
+                                           │
+                                           ├── GUA /64 → host network (RA)
+                                           └── ULA fd77:3be9:5d2e:1::/64 → k8s nodes (RA)
+                                                  │
+                                        ┌─────────┴─────────┐
+                                        │    k3s Cluster    │
+                                        │                   │
+                                        │  ULA (stable):    │
+                                        │  └─ nodes, pods,  │
+                                        │     ClusterIPs,   │
+                                        │     BGP peers     │
+                                        │                   │
+                                        │  GUA (dynamic):   │
+                                        │  └─ LoadBalancer  │
+                                        │     IPs only      │
+                                        └───────────────────┘
 ```
 
-**Subnet Allocation from /56:**
+**Address Types:**
+| Type | Prefix | Stability | Usage |
+|------|--------|-----------|-------|
+| ULA | `fd77:3be9:5d2e::/48` | Permanent | Nodes, pods, ClusterIPs, BGP |
+| GUA | `2001:a61:XXXX:YYYY::/64` | Changes with ISP | LoadBalancer IPs only |
+
+**ULA Subnet Allocation:**
 | Prefix | Assignment | Notes |
 |--------|------------|-------|
-| 79e0::/60 | Mikrotik hex-s | 16 /64s (79e0-79ef) |
-| 79fa::/64 | Unifi UDR7 | |
-| 79fb::/64 | pfSense | Single /64 delegation |
-| ├─ 79fb:0000-ffcb:: | pfSense LAN | Host/node network (RA advertised) |
-| ├─ 79fb:ffcc::/112 | k3s cluster-cidr | Pod network (BGP, filtered by BGPFilter) |
-| ├─ 79fb:ff00::/112 | k3s service-cidr | ClusterIP services (BGP advertised) |
-| └─ 79fb:ff01::/112 | k3s LoadBalancer | LoadBalancer IPs (BGP advertised) |
-| 79fc-79ff | Available | Future use |
+| fd77:3be9:5d2e:1::/64 | Node network | Via RA from pfSense |
+| fd77:3be9:5d2e:ffcc::/112 | k3s cluster-cidr | Pod network (65,536 IPs) |
+| fd77:3be9:5d2e:ff00::/112 | k3s service-cidr | ClusterIP services |
+| `<GUA>`:ff01::/112 | k3s LoadBalancer | LoadBalancer IPs (changes with ISP) |
 
 ## Architecture
 
@@ -50,57 +67,77 @@ IPv6-only Kubernetes cluster home lab setup running k3s on Debian 13 VMs in VMwa
   - Server nodes (control plane): use `k3s-server-config-set.sh`
   - Agent nodes (workers): use `k3s-agent-config-set.sh`
 
-### IPv6 Network Configuration
+### IPv6 Network Configuration (ULA + GUA Hybrid)
 
-**Single /64 Subnet Architecture:**
-This setup uses a single /64 subnet from Fritzbox with /112 ranges for k8s:
-- `2001:a61:1162:79fb::/64` - Full /64 allocation from pfSense
-  - `79fb:0000-ffcb::` - Host/node network (advertised via RA)
-  - `79fb:ffcc::/112` - Kubernetes pod network (routed via BGP)
-  - `79fb:ff00::/112` - Kubernetes service network (routed via BGP)
+**ISP Prefix Resilience Architecture:**
+This setup uses ULA for internal cluster networking and GUA for external LoadBalancer services. When the ISP changes the delegated prefix, only LoadBalancer IPs need updating—the cluster continues operating without disruption.
+
+**ULA Prefix:** `fd77:3be9:5d2e::/48` (permanent, never changes)
+**GUA Prefix:** `2001:a61:XXXX:YYYY::/64` (changes with ISP prefix delegation)
 
 **How it works:**
-- pfSense receives single `/64` via DHCPv6-PD from Fritzbox
-- pfSense advertises the full `/64` via Router Advertisements for host network
-- Nodes receive SLAAC addresses from the lower portion of the /64
-- k3s uses `79fb:ffcc::/112` for pods (learned via BGP from Calico, **filtered by BGPFilter**)
-- k3s uses `79fb:ff00::/112` for ClusterIP services (advertised via BGP)
-- k3s uses `79fb:ff01::/112` for LoadBalancer IPs (advertised via BGP)
+- pfSense receives GUA `/64` via DHCPv6-PD from Fritzbox
+- pfSense advertises BOTH the GUA /64 AND ULA `fd77:3be9:5d2e:1::/64` via Router Advertisements
+- Nodes receive dual-stack addresses: ULA for cluster traffic, GUA for internet access
+- k3s uses ULA for node-ip, cluster-cidr, and service-cidr (stable)
+- MetalLB uses GUA for LoadBalancer pool (must be updated when ISP prefix changes)
+- BGP peering uses ULA addresses (stable across prefix changes)
 - **BGPFilter** controls which routes are advertised to pfSense (rejects pod CIDR)
+
+**What uses ULA (stable):**
+- Node IPs for k3s (`fd77:3be9:5d2e:1::XXXX`)
+- Pod network (`fd77:3be9:5d2e:ffcc::/112`)
+- ClusterIP services (`fd77:3be9:5d2e:ff00::/112`)
+- BGP peer addresses
+- pfSense BIND server (`fd77:3be9:5d2e:1::1`)
+
+**What uses GUA (changes with ISP):**
+- LoadBalancer IPs (`<GUA-prefix>:ff01::/112`)
+- Pod outbound NAT66 (if configured)
+- DNS records for LoadBalancer services (auto-updated by ExternalDNS)
 
 **Node network:**
 - Nodes use systemd-networkd for IPv6 SLAAC (Stateless Address Autoconfiguration)
-- Global IPv6 addresses obtained via router advertisements from pfSense
-- No static IP assignment - addresses discovered dynamically
+- Nodes receive BOTH ULA and GUA addresses via router advertisements from pfSense
+- k3s uses ULA address for node-ip (stable across ISP prefix changes)
 - DNS registration via `nsupdate-pfsense-bind.sh` to pfSense BIND9 (port 5353)
 
 ### k3s Cluster Architecture
 - **Networking:** Calico CNI replaces built-in Flannel (disabled)
-- **Service Advertisement:** Calico BGP peers with pfSense to advertise cluster services to home network
-- **Load Balancing:** Traefik disabled (can be replaced with custom ingress)
+- **Service Advertisement:** Calico BGP peers with pfSense over ULA to advertise cluster services
+- **Load Balancing:** MetalLB assigns GUA LoadBalancer IPs from ISP prefix
 - **Storage:** local-path-provisioner (built-in k3s)
 
-### Critical Network Parameters (Auto-detected)
+### Network Parameters
 
-Scripts dynamically determine from the environment:
-- IPv6 prefix (/48) extracted from node address: first 3 hextets (e.g., `2001:a61:1162`)
-- 4th hextet extracted from node address (e.g., `79fb` for host network)
-- Node network: `<prefix>:<4th-hextet>::/64` (auto-assigned via RA from pfSense)
-- Cluster CIDR: `<prefix>:<4th-hextet>:ffcc::/112` (65,536 pod IPs)
-- Service CIDR: `<prefix>:<4th-hextet>:ff00::/112` (65,536 service IPs)
-- Cluster DNS: `<prefix>:<4th-hextet>:ff00::10`
-- Node CIDR allocation: /120 per node (256 pod IPs per node)
-
-**Example with current prefix:**
+**Fixed ULA Configuration (never changes):**
 ```
-Node address:   2001:a61:1162:79fb:xxxx:xxxx:xxxx:xxxx
-Cluster CIDR:   2001:a61:1162:79fb:ffcc::/112
-Service CIDR:   2001:a61:1162:79fb:ff00::/112
-Cluster DNS:    2001:a61:1162:79fb:ff00::10
+ULA Prefix:     fd77:3be9:5d2e::/48
+Node network:   fd77:3be9:5d2e:1::/64 (via RA from pfSense)
+Cluster CIDR:   fd77:3be9:5d2e:ffcc::/112 (pods)
+Service CIDR:   fd77:3be9:5d2e:ff00::/112 (ClusterIP)
+Cluster DNS:    fd77:3be9:5d2e:ff00::10
 Per-node CIDR:  /120 (256 pod IPs per node, supports 256 nodes)
+pfSense BIND:   fd77:3be9:5d2e:1::1:5353
+BGP Peer:       fd77:3be9:5d2e:1::1 (pfSense)
 ```
 
-**Important:** The script `k3s-server-config-set.sh` extracts the first 4 hextets from the node's IPv6 address to dynamically configure cluster networking. Using /112 for cluster-cidr with /120 per-node allocation provides a balanced approach: 65,536 total pod IPs with 256 IPs per node, supporting up to 256 nodes in the cluster.
+**Dynamic GUA Configuration (changes with ISP):**
+```
+GUA Prefix:      <current-ISP-prefix>::/64 (e.g., 2001:a61:35b3:cdfa::/64)
+LoadBalancer:    <GUA-prefix>:ff01::/112 (MetalLB pool)
+```
+
+**Example addresses:**
+```
+Node ULA:       fd77:3be9:5d2e:1:abc:def:123:456
+Node GUA:       2001:a61:35b3:cdfa:abc:def:123:456
+Pod IP:         fd77:3be9:5d2e:ffcc::1234
+ClusterIP:      fd77:3be9:5d2e:ff00::5678
+LoadBalancer:   2001:a61:35b3:cdfa:ff01::1
+```
+
+**Important:** The script `k3s-server-config-set.sh` uses a fixed ULA prefix for cluster networking. This makes the cluster immune to ISP prefix changes—only the MetalLB LoadBalancer pool needs updating when the prefix changes.
 
 ## Prerequisites
 
@@ -236,24 +273,38 @@ rm -rf /var/log/* /tmp/* /var/tmp/*
 
 **pfSense router must have:**
 - **DHCPv6-PD client** configured on WAN to request /64 from Fritzbox
-- **Single /64 subnet** for both host network and cluster traffic:
-  - 79fb::/64 for host network (advertised via RA)
-  - 79fb:ffcc::/112 for k3s cluster-cidr (routed via BGP, NOT advertised via RA)
-  - 79fb:ff00::/112 for k3s service-cidr
-- IPv6 Router Advertisements enabled for host subnet
+- **Dual-stack LAN configuration:**
+  - GUA /64 from DHCPv6-PD (advertised via RA)
+  - ULA Virtual IP: `fd77:3be9:5d2e:1::1/64` (advertised via RA)
+- **Router Advertisements** advertising BOTH prefixes to k8s VMs
 - DNS64/NAT64 configured for IPv4 reachability from IPv6-only hosts
-- BIND9 running on port 5353 for dynamic DNS updates
+- BIND9 running on ULA address (`fd77:3be9:5d2e:1::1:5353`) for dynamic DNS updates
 - FRR package installed and configured for BGP (AS 65101)
-- BGP peer group configured to accept connections from k8s nodes (AS 65010)
-- **BGP learns routes** for cluster CIDR subnet (79fb:ffcc::/112) from Calico
+- BGP peer group configured to accept connections from ULA range (`fd77:3be9:5d2e:1::/64`)
 
-**pfSense DHCPv6-PD Configuration:**
-1. Interfaces → WAN → IPv6 Configuration Type: DHCPv6
-2. DHCPv6 Client Configuration:
-   - Prefix Delegation Size: /64
-   - Send IPv6 prefix hint: Enabled
-3. Interfaces → LAN → Track Interface → WAN with Prefix ID: 0
-4. 79fb:ffcc::/112 is routed automatically via BGP from k3s/Calico nodes
+**pfSense ULA Configuration:**
+1. Interfaces → LAN → Add Virtual IP: `fd77:3be9:5d2e:1::1/64`
+2. Services → Router Advertisement → LAN:
+   - Advertise both GUA and ULA prefixes
+   - ULA prefix: `fd77:3be9:5d2e:1::/64`
+3. Services → BIND DNS:
+   - Listen on `fd77:3be9:5d2e:1::1` (port 5353)
+4. FRR BGP Configuration:
+   ```
+   router bgp 65101
+     neighbor k8s peer-group
+     neighbor k8s remote-as 65010
+     bgp listen range fd77:3be9:5d2e:1::/64 peer-group k8s
+     address-family ipv6 unicast
+       neighbor k8s activate
+   ```
+
+**Optional NAT66 for Pod Outbound:**
+If pods need to initiate connections to the internet:
+- Create NPt (Network Prefix Translation) rule on pfSense
+- Internal: `fd77:3be9:5d2e:ffcc::/112` (pod CIDR)
+- External: Use current GUA prefix
+- Direction: Outbound only
 
 **VMware Fusion configuration:**
 - VMs must use bridged networking to access the IPv6 home network
@@ -315,12 +366,7 @@ curl -sfL https://get.k3s.io | K3S_TOKEN=supersecret! sh -s - agent --server htt
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/operator-crds.yaml
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/tigera-operator.yaml
 
-# Get the /48 prefix and 4th hextet from node IP
-NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
-PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
-HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
-
-# Configure Calico with IPv6 using /112 cluster-cidr with /120 per-node blocks
+# Configure Calico with ULA IPv6 pool (stable across ISP prefix changes)
 kubectl create -f - <<EOF
 apiVersion: operator.tigera.io/v1
 kind: Installation
@@ -330,12 +376,14 @@ spec:
   calicoNetwork:
     ipPools:
       - blockSize: 120
-        cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
+        cidr: fd77:3be9:5d2e:ffcc::/112
         encapsulation: None
         natOutgoing: Disabled
         nodeSelector: all()
     nodeAddressAutodetectionV6:
-      kubernetes: NodeInternalIP
+      # Detect ULA addresses for node IPs
+      cidrs:
+        - "fd77:3be9:5d2e:1::/64"
 EOF
 
 # Create API server
@@ -357,12 +405,15 @@ BGP AS Numbers:
 | k3s/Calico | 65010 |
 
 ```bash
-# Get the /48 prefix and 4th hextet
-NODE_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fe80' | head -1)
-PREFIX_48=$(echo $NODE_IP | cut -d: -f1-3)
-HEXTET_4=$(echo $NODE_IP | cut -d: -f4)
+# Get current GUA prefix for LoadBalancer pool (changes with ISP)
+GUA_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fc' | grep -v '^fe80' | head -1)
+GUA_PREFIX=$(echo $GUA_IP | cut -d: -f1-4)
 
-# 1. Configure Calico BGP with custom AS number and service advertisement
+echo "ULA prefix (stable):     fd77:3be9:5d2e"
+echo "GUA prefix (from ISP):   $GUA_PREFIX"
+echo "LoadBalancer pool:       ${GUA_PREFIX}:ff01::/112"
+
+# 1. Configure Calico BGP with ULA service CIDR and GUA LoadBalancer pool
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPConfiguration
@@ -371,7 +422,11 @@ metadata:
 spec:
   asNumber: 65010
   serviceClusterIPs:
-  - cidr: ${PREFIX_48}:${HEXTET_4}:ff00::/112
+    # ClusterIP services use ULA (stable)
+    - cidr: fd77:3be9:5d2e:ff00::/112
+  serviceLoadBalancerIPs:
+    # LoadBalancer IPs use GUA (update this when ISP prefix changes)
+    - cidr: ${GUA_PREFIX}:ff01::/112
 EOF
 
 # 2. Create secret for BGP password (must be in calico-system namespace)
@@ -414,7 +469,7 @@ subjects:
   namespace: calico-system
 EOF
 
-# 4. Create BGPFilter to control route advertisements (optional but recommended)
+# 4. Create BGPFilter to control route advertisements
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPFilter
@@ -425,24 +480,24 @@ spec:
     # Reject pod CIDR advertisements to pfSense (not needed on router)
     - action: Reject
       matchOperator: In
-      cidr: ${PREFIX_48}:${HEXTET_4}:ffcc::/112
-    # Default action is Accept - ClusterIP and LoadBalancer CIDRs pass through
+      cidr: fd77:3be9:5d2e:ffcc::/112
+    # Default action is Accept - ClusterIP (ULA) and LoadBalancer (GUA) pass through
 EOF
 
-# 5. Add pfSense as BGP peer with password authentication and filter
+# 5. Add pfSense as BGP peer using ULA address (stable across ISP changes)
 kubectl apply -f - <<EOF
 apiVersion: projectcalico.org/v3
 kind: BGPPeer
 metadata:
   name: pfsense
 spec:
-  peerIP: <pfsense-ipv6-address>
+  # Use pfSense ULA address (stable, never changes)
+  peerIP: fd77:3be9:5d2e:1::1
   asNumber: 65101
   password:
     secretKeyRef:
       name: bgp-secrets
       key: pfsense-password
-  # Apply filter to control route advertisements
   filters:
     - pfsense-export-filter
 EOF
@@ -472,13 +527,18 @@ See [k3s-api-loadbalancer.md](k3s-api-loadbalancer.md) for complete setup guide.
 
 **Quick setup:**
 ```bash
-# Convert kubernetes service to LoadBalancer
-kubectl patch svc kubernetes -p '{"spec":{"type":"LoadBalancer","loadBalancerIP":"2001:a61:1162:79fb:ff01::1"}}'
+# Get current GUA prefix for LoadBalancer IP
+GUA_PREFIX=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fc' | grep -v '^fe80' | head -1 | cut -d: -f1-4)
+
+# Convert kubernetes service to LoadBalancer with GUA IP
+kubectl patch svc kubernetes -p "{\"spec\":{\"type\":\"LoadBalancer\",\"loadBalancerIP\":\"${GUA_PREFIX}:ff01::1\"}}"
 kubectl annotate svc kubernetes external-dns.alpha.kubernetes.io/hostname=api.k8s.lzadm.com
 
-# Update kubeconfig to use LoadBalancer
+# Update kubeconfig to use LoadBalancer DNS name (resilient to prefix changes)
 kubectl config set-cluster default --server=https://api.k8s.lzadm.com:443
 ```
+
+**Note:** The API LoadBalancer IP will change when the ISP prefix changes, but `api.k8s.lzadm.com` will be automatically updated by ExternalDNS.
 
 **Alternative: Direct node access**
 
@@ -878,8 +938,8 @@ ExternalDNS will automatically:
 # Check ExternalDNS logs
 kubectl logs -n external-dns -l app=external-dns
 
-# Query DNS record
-dig @2001:a61:1162:79fb:2e0:4cff:fe68:9ff -p 5353 myapp.k8s.lzadm.com AAAA +short
+# Query DNS record using ULA address (stable)
+dig @fd77:3be9:5d2e:1::1 -p 5353 myapp.k8s.lzadm.com AAAA +short
 
 # From home network
 dig myapp.k8s.lzadm.com AAAA +short
@@ -930,18 +990,21 @@ See [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md#rotatingupdating-t
 ## Key Script Behaviors
 
 ### k3s-server-config-set.sh
-- Detects primary IPv6 interface and stable global address (excludes temporary/privacy addresses)
-- Extracts first 3 hextets as /48 prefix (e.g., `2001:a61:1162`)
-- Uses hardcoded `79fd` as fourth hextet for cluster-cidr (separate from host network `79fc`)
+- Uses fixed ULA prefix `fd77:3be9:5d2e` for all internal cluster networking
+- Detects node's ULA address from SLAAC (must match prefix `fd77:3be9:5d2e`)
+- Also detects GUA address for reference (used for LoadBalancer pool suggestion)
 - Generates `/etc/rancher/k3s/config.yaml` with:
-  - `cluster-cidr: <prefix>:79fd::/64`
-  - `service-cidr: <prefix>:79fd:ff00::/112`
-  - `cluster-dns: <prefix>:79fd:ff00::10`
+  - `node-ip: <ULA-address>` (stable across ISP prefix changes)
+  - `cluster-cidr: fd77:3be9:5d2e:ffcc::/112` (stable)
+  - `service-cidr: fd77:3be9:5d2e:ff00::/112` (stable)
+  - `cluster-dns: fd77:3be9:5d2e:ff00::10` (stable)
 - Must be run BEFORE k3s installation
+- Outputs suggested LoadBalancer pool CIDR based on current GUA prefix
 
 ### k3s-agent-config-set.sh
-- Similar to server script but generates minimal config (no cluster/service CIDR)
-- Only sets node IP and disables default networking
+- Uses fixed ULA prefix `fd77:3be9:5d2e` for node-ip detection
+- Generates minimal config with ULA node-ip
+- Must be run BEFORE k3s agent installation
 
 ### nsupdate-pfsense-bind.sh
 - Auto-discovers IPv6 address, DNS server, and search domain
@@ -954,6 +1017,63 @@ See [k3s-external-dns-pfsense.md](k3s-external-dns-pfsense.md#rotatingupdating-t
 - Clears logs and temporary files
 - Prepares VM for snapshot/cloning
 - Run before taking template snapshot
+
+## ISP Prefix Change Procedure
+
+When the ISP changes your delegated IPv6 prefix (e.g., from `2001:a61:1162:79fb::` to `2001:a61:35b3:cdfa::`), only a few components need updating. The cluster continues operating because internal networking uses stable ULA addresses.
+
+**What changes:**
+- LoadBalancer IPs (MetalLB pool)
+- DNS records for LoadBalancer services (auto-updated by ExternalDNS)
+- NAT66 rule (if configured for pod outbound)
+
+**What stays the same:**
+- Node IPs (ULA)
+- Pod IPs (ULA)
+- ClusterIP services (ULA)
+- BGP peer addresses (ULA)
+- pfSense BIND address (ULA)
+
+### Procedure
+
+1. **Detect the new GUA prefix:**
+   ```bash
+   # On any node
+   GUA_IP=$(ip -6 addr show scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | grep -v '^fd' | grep -v '^fc' | grep -v '^fe80' | head -1)
+   NEW_GUA_PREFIX=$(echo $GUA_IP | cut -d: -f1-4)
+   echo "New GUA prefix: $NEW_GUA_PREFIX"
+   echo "New LoadBalancer pool: ${NEW_GUA_PREFIX}:ff01::/112"
+   ```
+
+2. **Update Calico BGPConfiguration (serviceLoadBalancerIPs):**
+   ```bash
+   calicoctl patch bgpconfiguration default -p "{\"spec\":{\"serviceLoadBalancerIPs\":[{\"cidr\":\"${NEW_GUA_PREFIX}:ff01::/112\"}]}}"
+   ```
+
+3. **Update MetalLB IPAddressPool:**
+   ```bash
+   kubectl patch ipaddresspool default -n metallb-system --type=merge -p "{\"spec\":{\"addresses\":[\"${NEW_GUA_PREFIX}:ff01::/112\"]}}"
+   ```
+
+4. **Update NAT66 rule on pfSense (if using pod outbound NAT):**
+   - Navigate to Firewall → NAT → NPt
+   - Update the external prefix to match the new GUA
+
+5. **Verify LoadBalancer services get new IPs:**
+   ```bash
+   kubectl get svc --all-namespaces -o wide | grep LoadBalancer
+   ```
+
+6. **ExternalDNS auto-updates DNS records:**
+   ```bash
+   # Check ExternalDNS logs
+   kubectl logs -n external-dns -l app=external-dns --tail=50
+
+   # Verify DNS records
+   dig api.k8s.lzadm.com AAAA +short
+   ```
+
+**No cluster restart required!** The cluster continues operating throughout the prefix change. Only external access via LoadBalancer IPs is briefly affected while DNS propagates.
 
 ## Troubleshooting
 
